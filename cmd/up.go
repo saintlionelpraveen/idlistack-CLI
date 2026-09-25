@@ -630,6 +630,15 @@ const (
 // detectClusterRuntime dynamically detects what Kubernetes cluster is active
 // by inspecting the kubectl context and node metadata.
 func detectClusterRuntime(ctx context.Context) (ClusterRuntime, string) {
+	// 0. Check node's container runtime directly (Highest precision: docker vs containerd)
+	nodeRuntimeCmd := exec.CommandContext(ctx, "kubectl", "get", "nodes", "-o", "jsonpath={.items[0].status.nodeInfo.containerRuntimeVersion}")
+	if nodeRuntimeOut, err := nodeRuntimeCmd.Output(); err == nil {
+		rtStr := strings.ToLower(strings.TrimSpace(string(nodeRuntimeOut)))
+		if strings.HasPrefix(rtStr, "docker://") {
+			return RuntimeDockerDesktop, "Docker (images shared directly)"
+		}
+	}
+
 	// 1. Check kubectl current-context name
 	ctxCmd := exec.CommandContext(ctx, "kubectl", "config", "current-context")
 	ctxOut, err := ctxCmd.Output()
@@ -690,8 +699,8 @@ func loadImageIntoCluster(ctx context.Context, imageTag string) (ClusterRuntime,
 		ui.Detail("Detected cluster: %s (kind)", color.CyanString(info))
 		return runtime, loadIntoKind(ctx, imageTag, info)
 	case RuntimeDockerDesktop:
-		ui.Detail("Detected cluster: Docker Desktop (images shared)")
-		// Docker Desktop shares the Docker daemon — no loading needed
+		ui.Detail("Detected cluster: %s", color.CyanString(info))
+		// Docker runtime shares the host daemon — no loading needed
 		return runtime, nil
 	default:
 		// Unknown cluster — try K3s first (it's our primary target),
@@ -709,44 +718,45 @@ func loadImageIntoCluster(ctx context.Context, imageTag string) (ClusterRuntime,
 
 func ensureK3sRunning(ctx context.Context) error {
 	// 1. Quick check: is K3s containerd socket responsive?
-	checkDirect := exec.CommandContext(ctx, "k3s", "ctr", "c", "ls")
-	if checkDirect.Run() == nil {
+	if exec.CommandContext(ctx, "k3s", "ctr", "c", "ls").Run() == nil {
 		return nil
 	}
-	checkSudo := exec.CommandContext(ctx, "sudo", "-n", "k3s", "ctr", "c", "ls")
-	if checkSudo.Run() == nil {
+	if exec.CommandContext(ctx, "sudo", "-n", "k3s", "ctr", "c", "ls").Run() == nil {
 		return nil
 	}
 
-	ui.Warn("K3s cluster is not responding. Starting K3s (sudo systemctl start k3s)...")
+	ui.Warn("K3s containerd socket is not responding. Restarting K3s service...")
 
-	// 2. Try starting k3s service
-	startSudoN := exec.CommandContext(ctx, "sudo", "-n", "systemctl", "start", "k3s")
-	if startSudoN.Run() != nil {
-		startDirect := exec.CommandContext(ctx, "systemctl", "start", "k3s")
-		if startDirect.Run() != nil {
-			startInteractive := exec.CommandContext(ctx, "sudo", "systemctl", "start", "k3s")
-			startInteractive.Stdin = os.Stdin
-			startInteractive.Stdout = os.Stdout
-			startInteractive.Stderr = os.Stderr
-			_ = startInteractive.Run()
+	// 2. Restart k3s service to revive containerd
+	restartSudoN := exec.CommandContext(ctx, "sudo", "-n", "systemctl", "restart", "k3s")
+	if restartSudoN.Run() != nil {
+		restartDirect := exec.CommandContext(ctx, "systemctl", "restart", "k3s")
+		if restartDirect.Run() != nil {
+			restartInteractive := exec.CommandContext(ctx, "sudo", "systemctl", "restart", "k3s")
+			restartInteractive.Stdin = os.Stdin
+			restartInteractive.Stdout = os.Stdout
+			restartInteractive.Stderr = os.Stderr
+			_ = restartInteractive.Run()
 		}
 	}
 
-	// 3. Wait up to 15 seconds for containerd socket to be ready
+	// 3. Ensure containerd socket permissions
+	_ = exec.CommandContext(ctx, "sudo", "-n", "chmod", "666", "/run/k3s/containerd/containerd.sock").Run()
+
+	// 4. Wait up to 15 seconds for containerd socket to be ready
 	for i := 0; i < 15; i++ {
 		time.Sleep(1 * time.Second)
 		if exec.CommandContext(ctx, "k3s", "ctr", "c", "ls").Run() == nil {
-			ui.Success("K3s cluster is active and ready.")
+			ui.Success("K3s containerd is active and ready.")
 			return nil
 		}
 		if exec.CommandContext(ctx, "sudo", "-n", "k3s", "ctr", "c", "ls").Run() == nil {
-			ui.Success("K3s cluster is active and ready.")
+			ui.Success("K3s containerd is active and ready.")
 			return nil
 		}
 	}
 
-	return fmt.Errorf("K3s cluster is stopped. Start it with: sudo systemctl start k3s")
+	return fmt.Errorf("K3s containerd socket is not responding. Restart it with: sudo systemctl restart k3s")
 }
 
 func loadIntoK3s(ctx context.Context, imageTag string) error {
