@@ -117,8 +117,7 @@ idlistack down
    - *Layer 0:* Existing `Dockerfile` / `docker-compose.yml` (user-provided).
    - *Layer 0.5:* Specialized Dynamic Rules (Ghost CMS, Frappe Bench).
    - *Layer 1:* **Railpack Detection Engine** (Node, Python, Go, Rust, PHP, Java, Ruby, Elixir, .NET, Deno, Bun).
-   - *Layer 2:* Nixpacks Fallback.
-   - *Layer 3:* Gemini AI Fallback.
+   - *Layer 2:* Deep Heuristic Recursive Fallback (Safety Net).
 3. **Save Build Plan:** Normalizes runtime, build commands, and ports into `.idlistack/buildplan.json`.
 4. **Build OCI Image:** Compiles image via `railpack build` with BuildKit layer caching (or native multi-stage Dockerfile fallback).
 5. **Sideload to Cluster:** Saves and imports images directly into K3s containerd (`k3s ctr images import`) or Minikube/Kind.

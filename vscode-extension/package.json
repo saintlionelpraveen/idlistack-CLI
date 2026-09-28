@@ -3,7 +3,7 @@
   "displayName": "IdliStack",
   "description": "Zero-config deployment CLI extension directly in VS Code (Railway-like detection, OCI build & K3s deployment)",
   "version": "1.8.0",
-  "publisher": "idlistack",
+  "publisher": "idlistackcli",
   "engines": {
     "vscode": "^1.80.0"
   },

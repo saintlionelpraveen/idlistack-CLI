@@ -24,7 +24,7 @@ IdliStack is a production-grade deployment orchestrator that abstracts the compl
 | **CLI Framework** | [Cobra](https://github.com/spf13/cobra) (Go) | Command parsing, subcommands (`up`, `down`, `status`, `env`, `init`), flags, and contextual help. |
 | **Configuration** | TOML | Parses `idlistack.toml` for optional project-specific overrides. |
 | **Primary Build Engine** | [Railpack](https://railpack.com) (v0.39+) | Modern BuildKit-based planner & OCI image compiler by Railway. |
-| **Fallback Detection** | Nixpacks & Gemini AI | Secondary and tertiary fallback engines for rare or complex edge cases. |
+| **Detection Engine** | Railpack + Dynamic Rules | Stack, runtime version, and start command inference with heuristic fallback. |
 | **Image Builder** | Docker Engine & BuildKit | Compiles inferred architectures into OCI-compliant images with multi-tier caching. |
 | **Cluster Runtime** | K3s (containerd) | Lightweight, single-binary Kubernetes distribution with direct image sideloading. |
 | **Orchestrator** | Helm v3 | Scaffolds and manages Kubernetes resources atomically (deployments, rollbacks, hooks). |
@@ -62,9 +62,7 @@ The detection hierarchy identifies the stack, runtime version, and start command
 ├─────────────────────────────────────────────────────────────┤
 │ Layer 1: Railpack Detection Engine (Primary v0.39+)         │
 ├─────────────────────────────────────────────────────────────┤
-│ Layer 2: Nixpacks Fallback                                  │
-├─────────────────────────────────────────────────────────────┤
-│ Layer 3: Gemini AI Fallback (Last Resort)                   │
+│ Layer 2: Deep Heuristic Recursive Fallback (Safety Net)     │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -152,8 +150,7 @@ CLI/
 │   │   ├── detect.go                # Orchestrator & layer priority
 │   │   ├── railpack.go              # Railpack v0.39+ resolver, downloader & parser
 │   │   ├── rules.go                 # Dynamic framework rules engine
-│   │   ├── frameworks.json          # Specialized framework signatures
-│   │   └── llm.go                   # Gemini AI fallback
+│   │   └── frameworks.json          # Specialized framework signatures
 │   ├── k8s/                         # Kubernetes logic
 │   │   └── deployer.go              # Helm chart generator, dependencies, and rollout
 │   └── ui/                          # Terminal UI components and banners

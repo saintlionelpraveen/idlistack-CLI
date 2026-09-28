@@ -10,15 +10,10 @@ import (
 
 // Config represents the idlistack.toml configuration
 type Config struct {
-	Project ProjectConfig         `toml:"project"`
-	Build   BuildConfig           `toml:"build"`
-	Deploy  DeployConfig          `toml:"deploy"`
-	AI      AIConfig              `toml:"ai"`
-	Env     map[string]string     `toml:"env"`
-}
-
-type AIConfig struct {
-	ApiKey string `toml:"api_key"`
+	Project ProjectConfig     `toml:"project"`
+	Build   BuildConfig       `toml:"build"`
+	Deploy  DeployConfig      `toml:"deploy"`
+	Env     map[string]string `toml:"env"`
 }
 
 type ProjectConfig struct {

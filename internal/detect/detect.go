@@ -2,10 +2,8 @@ package detect
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -45,9 +43,9 @@ func applyConfigOverrides(plan *buildplan.Plan, cfg *config.Config) {
 // Detect runs the detection pipeline:
 //
 //	Layer 0: Check for existing Dockerfile/docker-compose.yml
-//	Layer 1: Native provider detection (Railpack-style — NEW, primary engine)
-//	Layer 2: Nixpacks fallback (for edge cases)
-//	Layer 3: Gemini AI fallback (last resort)
+//	Layer 0.5: Dynamic Rules Detection
+//	Layer 1: Railpack Detection (primary engine)
+//	Layer 2: Deep heuristic recursive fallback (safety net)
 //
 // When both a Dockerfile and a provider match exist, an interactive
 // terminal prompt lets the user choose which build strategy to use.
@@ -108,7 +106,7 @@ func Detect(ctx context.Context, projectDir string, cfg *config.Config, verbose 
 
 	// Configured Provider wins over everything else
 	if cfg != nil && cfg.Build.Provider != "" {
-		if layerRailpackPlan != nil && errRp == nil && layerRailpackPlan.Provider == cfg.Build.Provider {
+		if layerRailpackPlan != nil && errRp == nil && layerRailpackPlan.DetectionSource == "railpack" && layerRailpackPlan.Provider == cfg.Build.Provider {
 			applyConfigOverrides(layerRailpackPlan, cfg)
 			layerRailpackPlan.Normalize()
 			return layerRailpackPlan, nil
@@ -117,6 +115,11 @@ func Detect(ctx context.Context, projectDir string, cfg *config.Config, verbose 
 			applyConfigOverrides(layer05Plan, cfg)
 			layer05Plan.Normalize()
 			return layer05Plan, nil
+		}
+		if layerRailpackPlan != nil && errRp == nil && layerRailpackPlan.Provider == cfg.Build.Provider {
+			applyConfigOverrides(layerRailpackPlan, cfg)
+			layerRailpackPlan.Normalize()
+			return layerRailpackPlan, nil
 		}
 		// Fallback: build directly using the configured provider
 		configPlan := buildplan.NewDefaultPlan()
@@ -139,44 +142,18 @@ func Detect(ctx context.Context, projectDir string, cfg *config.Config, verbose 
 		return layer05Plan, nil
 	}
 
-	// Layer 1: Railpack Detection (Primary)
+	// Layer 1: Railpack Detection (Primary) & Layer 2: Deep heuristic recursive fallback (Safety net)
 	if layerRailpackPlan != nil && errRp == nil {
 		if verbose {
-			ui.Detail("Detected by Railpack: %s (%s)", color.CyanString(layerRailpackPlan.Stack), color.HiBlackString(layerRailpackPlan.Runtime))
+			if layerRailpackPlan.DetectionSource == "heuristic" {
+				ui.Detail("Detected by heuristic fallback: %s (%s)", layerRailpackPlan.Stack, layerRailpackPlan.StartCmd)
+			} else {
+				ui.Detail("Detected by Railpack: %s (%s)", color.CyanString(layerRailpackPlan.Stack), color.HiBlackString(layerRailpackPlan.Runtime))
+			}
 		}
 		applyConfigOverrides(layerRailpackPlan, cfg)
 		layerRailpackPlan.Normalize()
 		return layerRailpackPlan, nil
-	}
-
-	// ─── Layer 2: Nixpacks fallback ─────────────────────────────────
-	if verbose {
-		ui.Detail("No Railpack plan matched, trying Nixpacks fallback...")
-	}
-	layer2Plan, err2 := detectWithNixpacks(ctx, projectDir, cfg, verbose)
-	if layer2Plan != nil && err2 == nil {
-		applyConfigOverrides(layer2Plan, cfg)
-		layer2Plan.Normalize()
-		return layer2Plan, nil
-	}
-
-	// ─── Layer 3: AI fallback ───────────────────────────────────────
-	layer3Plan, err3 := detectLLM(ctx, projectDir, cfg)
-	if layer3Plan != nil && err3 == nil {
-		applyConfigOverrides(layer3Plan, cfg)
-		layer3Plan.Normalize()
-		return layer3Plan, nil
-	}
-
-	// ─── Layer 4: Deep heuristic recursive fallback (Safety net) ────
-	layer4Plan, err4 := FallbackFileDetection(projectDir, verbose)
-	if layer4Plan != nil && err4 == nil {
-		if verbose {
-			ui.Detail("Detected by heuristic fallback: %s (%s)", layer4Plan.Stack, layer4Plan.StartCmd)
-		}
-		applyConfigOverrides(layer4Plan, cfg)
-		layer4Plan.Normalize()
-		return layer4Plan, nil
 	}
 
 	return nil, fmt.Errorf("could not detect application type. Create a Dockerfile or ensure your project has a recognizable structure")
@@ -437,122 +414,3 @@ func detectConfigPort(projectDir string) int {
 
 	return 0
 }
-
-// ─── Layer 2: Nixpacks Fallback ─────────────────────────────────────────
-
-func detectWithNixpacks(ctx context.Context, projectDir string, cfg *config.Config, verbose bool) (*buildplan.Plan, error) {
-	args := []string{"plan", projectDir, "--format", "json"}
-
-	bin := "nixpacks"
-	if _, err := exec.LookPath(bin); err != nil {
-		bin = "./nixpacks" // fallback to local binary
-	}
-
-	cmd := exec.CommandContext(ctx, bin, args...)
-	output, err := cmd.Output()
-	if err != nil {
-		if verbose {
-			fmt.Printf("  [debug] nixpacks plan failed: %v\n", err)
-		}
-		return nil, fmt.Errorf("nixpacks detection failed: %w", err)
-	}
-
-	return parseNixpacksPlan(output, projectDir, verbose)
-}
-
-// parseNixpacksPlan converts Nixpacks's plan JSON into our build plan format
-func parseNixpacksPlan(data []byte, projectDir string, verbose bool) (*buildplan.Plan, error) {
-	var nxPlan map[string]interface{}
-	if err := json.Unmarshal(data, &nxPlan); err != nil {
-		return nil, fmt.Errorf("failed to parse nixpacks plan: %w", err)
-	}
-
-	plan := buildplan.NewDefaultPlan()
-	plan.DetectionSource = "layer2-nixpacks"
-	plan.DetectionConfidence = "high"
-
-	// Provider can often be inferred from variables.NIXPACKS_METADATA
-	if vars, ok := nxPlan["variables"].(map[string]interface{}); ok {
-		if meta, ok := vars["NIXPACKS_METADATA"].(string); ok {
-			plan.Provider = meta
-			plan.DetectedFramework = meta
-		}
-
-		if plan.Env == nil {
-			plan.Env = make(map[string]string)
-		}
-		for k, v := range vars {
-			if valStr, ok := v.(string); ok {
-				plan.Env[k] = valStr
-			}
-		}
-	}
-
-	if start, ok := nxPlan["start"].(map[string]interface{}); ok {
-		if cmd, ok := start["cmd"].(string); ok {
-			plan.StartCmd = cmd
-		}
-	}
-
-	// Dynamic inference based on phases if provider is empty
-	if plan.Provider == "" {
-		rawStr, _ := json.Marshal(nxPlan)
-		lowerStr := strings.ToLower(string(rawStr))
-		if strings.Contains(lowerStr, "npm install") || strings.Contains(lowerStr, "node") {
-			plan.Provider = "node"
-		} else if strings.Contains(lowerStr, "pip install") || strings.Contains(lowerStr, "python") {
-			plan.Provider = "python"
-		} else if strings.Contains(lowerStr, "go build") || strings.Contains(lowerStr, "golang") {
-			plan.Provider = "go"
-		} else if strings.Contains(lowerStr, "cargo build") || strings.Contains(lowerStr, "rust") {
-			plan.Provider = "rust"
-		} else if strings.Contains(lowerStr, "composer install") || strings.Contains(lowerStr, "php") {
-			plan.Provider = "php"
-		}
-	}
-
-	if plan.DetectedFramework == "" {
-		plan.DetectedFramework = plan.Provider
-	}
-
-	if plan.Port == 0 {
-		plan.Port = detectConfigPort(projectDir)
-		if plan.Port == 0 {
-			switch plan.Provider {
-			case "node":
-				plan.Port = 3000
-			case "python":
-				plan.Port = 5000
-			case "go":
-				plan.Port = 8080
-			case "rust":
-				plan.Port = 8080
-			case "ruby":
-				plan.Port = 9292
-			case "java":
-				plan.Port = 8080
-			case "php":
-				plan.Port = 8080
-			case "elixir":
-				plan.Port = 4000
-			case "dotnet":
-				plan.Port = 5000
-			default:
-				plan.Port = 8080
-			}
-		}
-	}
-
-	if verbose {
-		raw, _ := json.MarshalIndent(nxPlan, "  ", "  ")
-		fmt.Printf("  [debug] Raw nixpacks plan:\n  %s\n", string(raw))
-	}
-
-	if plan.Provider == "" && plan.StartCmd == "" {
-		return nil, fmt.Errorf("nixpacks returned empty plan")
-	}
-
-	plan.Normalize()
-	return plan, nil
-}
-

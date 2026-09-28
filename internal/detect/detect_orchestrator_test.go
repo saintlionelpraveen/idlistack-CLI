@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/idlistack/cli/internal/config"
 )
 
 func TestDetectWithProviders_GhostCMS(t *testing.T) {
@@ -125,3 +127,88 @@ func TestDetect_FinanceSystem_SubfolderNode(t *testing.T) {
 	}
 }
 
+func TestDetect_EmptyDir_NoNixpacksOrAIFallback(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create a fake nixpacks binary on PATH that records if it was invoked
+	fakeBinDir := t.TempDir()
+	nixpacksMarker := filepath.Join(fakeBinDir, "nixpacks_invoked")
+	fakeNixpacks := filepath.Join(fakeBinDir, "nixpacks")
+	script := "#!/bin/sh\ntouch " + nixpacksMarker + "\necho '{\"variables\":{\"NIXPACKS_METADATA\":\"node\"},\"start\":{\"cmd\":\"node index.js\"}}'\n"
+	if err := os.WriteFile(fakeNixpacks, []byte(script), 0755); err != nil {
+		t.Fatalf("failed to write fake nixpacks binary: %v", err)
+	}
+
+	t.Setenv("PATH", fakeBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GEMINI_API_KEY", "test-fake-gemini-key")
+
+	plan, err := Detect(context.Background(), dir, nil, false)
+	if err == nil {
+		t.Fatalf("Expected error for empty directory without nixpacks/AI fallback, got plan: %+v", plan)
+	}
+	if plan != nil {
+		t.Errorf("Expected nil plan for empty directory, got: %+v", plan)
+	}
+	if _, statErr := os.Stat(nixpacksMarker); !os.IsNotExist(statErr) {
+		t.Errorf("Expected nixpacks binary never to be invoked, but marker file exists")
+	}
+}
+
+func TestDetect_ConfigProviderOverride(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{
+		Build: config.BuildConfig{
+			Provider: "node",
+			Runtime:  "20",
+			StartCmd: "node dist/main.js",
+		},
+		Deploy: config.DeployConfig{
+			Port: 4000,
+		},
+	}
+
+	plan, err := Detect(context.Background(), dir, cfg, false)
+	if err != nil {
+		t.Fatalf("Detect with config provider override failed: %v", err)
+	}
+	if plan.Provider != "node" {
+		t.Errorf("Expected Provider 'node', got %s", plan.Provider)
+	}
+	if plan.DetectionSource != "config" {
+		t.Errorf("Expected DetectionSource 'config', got %s", plan.DetectionSource)
+	}
+	if plan.Runtime != "20" {
+		t.Errorf("Expected Runtime '20', got %s", plan.Runtime)
+	}
+	if plan.StartCmd != "node dist/main.js" {
+		t.Errorf("Expected StartCmd 'node dist/main.js', got %s", plan.StartCmd)
+	}
+	if plan.Port != 4000 {
+		t.Errorf("Expected Port 4000, got %d", plan.Port)
+	}
+}
+
+func TestConfig_LegacyAISectionIgnored(t *testing.T) {
+	dir := createTestProject(t, map[string]string{
+		"idlistack.toml": `[project]
+name = "legacy-app"
+
+[build]
+provider = "python"
+
+[ai]
+api_key = "legacy-gemini-key"
+`,
+	})
+
+	cfg, err := config.Load(dir)
+	if err != nil {
+		t.Fatalf("Expected config.Load to succeed with legacy [ai] section, got error: %v", err)
+	}
+	if cfg.Project.Name != "legacy-app" {
+		t.Errorf("Expected project name 'legacy-app', got %s", cfg.Project.Name)
+	}
+	if cfg.Build.Provider != "python" {
+		t.Errorf("Expected build provider 'python', got %s", cfg.Build.Provider)
+	}
+}
