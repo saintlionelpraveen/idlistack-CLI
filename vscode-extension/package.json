@@ -1,9 +1,9 @@
 {
   "name": "idlistack-vscode",
   "displayName": "IdliStack",
-  "description": "Zero-config deployment CLI extension directly in VS Code (Railway-like detection, OCI build & K3s deployment)",
-  "version": "1.8.0",
-  "publisher": "idlistackcli",
+  "description": "Zero-config deployment CLI extension directly in VS Code (Keycloak OIDC + K3s RBAC, Railway-like detection, OCI build & Helm deployment)",
+  "version": "1.9.0",
+  "publisher": "idlistack",
   "engines": {
     "vscode": "^1.80.0"
   },
@@ -20,6 +20,26 @@
   "main": "./extension.js",
   "contributes": {
     "commands": [
+      {
+        "command": "idlistack.login",
+        "title": "IdliStack: Login with Keycloak (Auth Frontend)",
+        "icon": "$(shield)"
+      },
+      {
+        "command": "idlistack.authSetup",
+        "title": "IdliStack: Deploy Keycloak Auth Layer to K3s",
+        "icon": "$(key)"
+      },
+      {
+        "command": "idlistack.whoami",
+        "title": "IdliStack: Check Auth & K3s RBAC Status (Whoami)",
+        "icon": "$(account)"
+      },
+      {
+        "command": "idlistack.logout",
+        "title": "IdliStack: Logout from Keycloak",
+        "icon": "$(sign-out)"
+      },
       {
         "command": "idlistack.terminal",
         "title": "IdliStack: Open Terminal",
@@ -59,6 +79,10 @@
     "menus": {
       "editor/context": [
         {
+          "command": "idlistack.login",
+          "group": "idlistack@0"
+        },
+        {
           "command": "idlistack.inspect",
           "group": "idlistack@1"
         },
@@ -68,6 +92,10 @@
         }
       ],
       "explorer/context": [
+        {
+          "command": "idlistack.login",
+          "group": "idlistack@0"
+        },
         {
           "command": "idlistack.inspect",
           "group": "idlistack@1"

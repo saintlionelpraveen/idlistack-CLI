@@ -33,7 +33,7 @@ var upCmd = &cobra.Command{
   3. Generates a build plan (JSON)
   4. Builds an OCI image via Railpack + BuildKit
   5. Loads the image into K3s
-  6. Deploys to Kubernetes via Helm
+  6. Deploys to K3s via Helm
 
 Use --inspect to preview the build plan without building or deploying.
 Use --detach to run the deployment in the background.`,
@@ -223,39 +223,25 @@ func runUp(cmd *cobra.Command, args []string) error {
 	}
 	ui.Detail("Image: %s", color.CyanString(imageTag))
 
-	// ─── Step 5: Load image into cluster ─────────────────────────────────
-	ui.Step(5, 6, "Loading image into cluster")
+	// ─── Step 5: Load image into K3s ─────────────────────────────────────
+	ui.Step(5, 6, "Loading image into K3s")
 
+	k8s.EnsureK3sContext(ctx)
 	deployer := k8s.NewDeployer(cfg, plan, imageTag, cwd)
 	requiredImages := deployer.GetRequiredImages()
 
-	var clusterRuntime ClusterRuntime
 	for _, img := range requiredImages {
 		if !strings.HasPrefix(img, "idlistack/") {
 			ensureHostDockerImage(ctx, img)
 		}
-		rt, err := loadImageIntoCluster(ctx, img)
-		if err != nil {
-			return fmt.Errorf("image load failed for %s: %w", img, err)
+		if err := loadIntoK3s(ctx, img); err != nil {
+			return fmt.Errorf("K3s image load failed for %s: %w", img, err)
 		}
-		clusterRuntime = rt
 	}
+	ui.Detail("All images loaded into K3s containerd")
 
-	runtimeName := "cluster"
-	switch clusterRuntime {
-	case RuntimeMinikube:
-		runtimeName = "minikube"
-	case RuntimeK3s:
-		runtimeName = "K3s containerd"
-	case RuntimeKind:
-		runtimeName = "kind"
-	case RuntimeDockerDesktop:
-		runtimeName = "Docker Desktop"
-	}
-	ui.Detail("All images loaded into %s", runtimeName)
-
-	// ─── Step 6: Deploy to Kubernetes via Helm ───────────────────────────────
-	ui.Step(6, 6, "Deploying to Kubernetes via Helm")
+	// ─── Step 6: Deploy to K3s via Helm ──────────────────────────────────
+	ui.Step(6, 6, "Deploying to K3s via Helm")
 
 	url, err := deployer.Deploy(ctx, Verbose)
 	if err != nil {
@@ -616,106 +602,6 @@ func resolveBaseImage(plan *buildplan.Plan) string {
 	}
 }
 
-// ClusterRuntime represents the detected Kubernetes cluster type
-type ClusterRuntime int
-
-const (
-	RuntimeUnknown ClusterRuntime = iota
-	RuntimeMinikube
-	RuntimeK3s
-	RuntimeKind
-	RuntimeDockerDesktop
-)
-
-// detectClusterRuntime dynamically detects what Kubernetes cluster is active
-// by inspecting the kubectl context and node metadata.
-func detectClusterRuntime(ctx context.Context) (ClusterRuntime, string) {
-	// 0. Check node's container runtime directly (Highest precision: docker vs containerd)
-	nodeRuntimeCmd := exec.CommandContext(ctx, "kubectl", "get", "nodes", "-o", "jsonpath={.items[0].status.nodeInfo.containerRuntimeVersion}")
-	if nodeRuntimeOut, err := nodeRuntimeCmd.Output(); err == nil {
-		rtStr := strings.ToLower(strings.TrimSpace(string(nodeRuntimeOut)))
-		if strings.HasPrefix(rtStr, "docker://") {
-			return RuntimeDockerDesktop, "Docker (images shared directly)"
-		}
-	}
-
-	// 1. Check kubectl current-context name
-	ctxCmd := exec.CommandContext(ctx, "kubectl", "config", "current-context")
-	ctxOut, err := ctxCmd.Output()
-	if err == nil {
-		context := strings.TrimSpace(string(ctxOut))
-		if context == "minikube" || strings.HasPrefix(context, "minikube") {
-			return RuntimeMinikube, context
-		}
-		if strings.Contains(context, "k3s") || strings.Contains(context, "k3d") || context == "default" {
-			return RuntimeK3s, context
-		}
-		if strings.HasPrefix(context, "kind-") {
-			clusterName := strings.TrimPrefix(context, "kind-")
-			return RuntimeKind, clusterName
-		}
-		if context == "docker-desktop" {
-			return RuntimeDockerDesktop, context
-		}
-	}
-
-	// 2. Check node name/labels for more signal
-	nodeCmd := exec.CommandContext(ctx, "kubectl", "get", "nodes", "-o", "jsonpath={.items[0].metadata.name}")
-	nodeOut, err := nodeCmd.Output()
-	if err == nil {
-		nodeName := strings.TrimSpace(string(nodeOut))
-		if nodeName == "minikube" {
-			return RuntimeMinikube, nodeName
-		}
-		if strings.HasPrefix(nodeName, "kind-") || strings.Contains(nodeName, "kind") {
-			return RuntimeKind, strings.TrimPrefix(strings.TrimSuffix(nodeName, "-control-plane"), "kind-")
-		}
-	}
-
-	// 3. Check if k3s is the active API server
-	if _, err := exec.LookPath("k3s"); err == nil {
-		checkCmd := exec.CommandContext(ctx, "k3s", "kubectl", "cluster-info")
-		if checkCmd.Run() == nil {
-			return RuntimeK3s, "default"
-		}
-	}
-
-	return RuntimeUnknown, ""
-}
-
-// loadImageIntoCluster dynamically detects the active Kubernetes cluster runtime
-// and loads the Docker image into it using the appropriate method.
-func loadImageIntoCluster(ctx context.Context, imageTag string) (ClusterRuntime, error) {
-	runtime, info := detectClusterRuntime(ctx)
-
-	switch runtime {
-	case RuntimeMinikube:
-		ui.Detail("Detected cluster: %s (minikube)", color.CyanString(info))
-		return runtime, loadIntoMinikube(ctx, imageTag)
-	case RuntimeK3s:
-		ui.Detail("Detected cluster: %s (K3s)", color.CyanString(info))
-		return runtime, loadIntoK3s(ctx, imageTag)
-	case RuntimeKind:
-		ui.Detail("Detected cluster: %s (kind)", color.CyanString(info))
-		return runtime, loadIntoKind(ctx, imageTag, info)
-	case RuntimeDockerDesktop:
-		ui.Detail("Detected cluster: %s", color.CyanString(info))
-		// Docker runtime shares the host daemon — no loading needed
-		return runtime, nil
-	default:
-		// Unknown cluster — try K3s first (it's our primary target),
-		// fall back to minikube if that fails
-		ui.Detail("Unknown cluster runtime, attempting K3s image import...")
-		if err := loadIntoK3s(ctx, imageTag); err != nil {
-			ui.Detail("K3s import failed, trying minikube...")
-			if err := loadIntoMinikube(ctx, imageTag); err != nil {
-				return runtime, fmt.Errorf("could not load image into any detected cluster runtime: %w", err)
-			}
-		}
-		return runtime, nil
-	}
-}
-
 func ensureK3sRunning(ctx context.Context) error {
 	// 1. Quick check: is K3s containerd socket responsive?
 	if exec.CommandContext(ctx, "k3s", "ctr", "c", "ls").Run() == nil {
@@ -725,9 +611,15 @@ func ensureK3sRunning(ctx context.Context) error {
 		return nil
 	}
 
+	// 2. Fix /run/k3s/containerd/containerd.sock permissions via in-cluster DaemonSet (no sudo required)
+	k8s.EnsureContainerdSocketPermissions(ctx)
+	if exec.CommandContext(ctx, "k3s", "ctr", "c", "ls").Run() == nil {
+		return nil
+	}
+
 	ui.Warn("K3s containerd socket is not responding. Restarting K3s service...")
 
-	// 2. Restart k3s service to revive containerd
+	// 3. Restart k3s service to revive containerd
 	restartSudoN := exec.CommandContext(ctx, "sudo", "-n", "systemctl", "restart", "k3s")
 	if restartSudoN.Run() != nil {
 		restartDirect := exec.CommandContext(ctx, "systemctl", "restart", "k3s")
@@ -740,10 +632,11 @@ func ensureK3sRunning(ctx context.Context) error {
 		}
 	}
 
-	// 3. Ensure containerd socket permissions
+	// 4. Ensure containerd socket permissions
 	_ = exec.CommandContext(ctx, "sudo", "-n", "chmod", "666", "/run/k3s/containerd/containerd.sock").Run()
+	k8s.EnsureContainerdSocketPermissions(ctx)
 
-	// 4. Wait up to 15 seconds for containerd socket to be ready
+	// 5. Wait up to 15 seconds for containerd socket to be ready
 	for i := 0; i < 15; i++ {
 		time.Sleep(1 * time.Second)
 		if exec.CommandContext(ctx, "k3s", "ctr", "c", "ls").Run() == nil {
@@ -812,40 +705,6 @@ func ensureHostDockerImage(ctx context.Context, img string) {
 	pullCmd.Stdout = os.Stdout
 	pullCmd.Stderr = os.Stderr
 	_ = pullCmd.Run()
-}
-
-func loadIntoMinikube(ctx context.Context, imageTag string) error {
-	// If it's a dependency image already present in minikube, skip to avoid slow re-loading
-	if !strings.HasPrefix(imageTag, "idlistack/") {
-		checkCmd := exec.CommandContext(ctx, "minikube", "image", "ls")
-		if out, err := checkCmd.Output(); err == nil {
-			lines := strings.Split(string(out), "\n")
-			for _, line := range lines {
-				trimmed := strings.TrimSpace(line)
-				if trimmed == imageTag || strings.HasSuffix(trimmed, "/"+imageTag) || strings.HasSuffix(trimmed, imageTag) {
-					ui.Detail("Image %s already present in minikube", color.HiBlackString(imageTag))
-					return nil
-				}
-			}
-		}
-	}
-
-	ui.Detail("Loading %s into minikube...", color.CyanString(imageTag))
-	loadCmd := exec.CommandContext(ctx, "minikube", "image", "load", imageTag)
-	loadCmd.Stdout = os.Stdout
-	loadCmd.Stderr = os.Stderr
-	return loadCmd.Run()
-}
-
-func loadIntoKind(ctx context.Context, imageTag string, clusterName string) error {
-	args := []string{"load", "docker-image", imageTag}
-	if clusterName != "" {
-		args = append(args, "--name", clusterName)
-	}
-	loadCmd := exec.CommandContext(ctx, "kind", args...)
-	loadCmd.Stdout = os.Stdout
-	loadCmd.Stderr = os.Stderr
-	return loadCmd.Run()
 }
 
 // zipDirectory creates a zip archive of the project (unused for now, for future remote upload)

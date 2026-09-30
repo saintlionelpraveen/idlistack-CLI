@@ -4,10 +4,10 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 
 	"github.com/fatih/color"
+	"github.com/idlistack/cli/internal/auth"
 	"github.com/idlistack/cli/internal/config"
 	"github.com/idlistack/cli/internal/ui"
 	"github.com/spf13/cobra"
@@ -16,7 +16,7 @@ import (
 var downCmd = &cobra.Command{
 	Use:   "down",
 	Short: "Tear down the current project's deployment",
-	Long: `Removes all Kubernetes resources associated with the current project:
+	Long: `Removes all K3s resources associated with the current project:
   - Deployments
   - Services
   - Ingresses
@@ -24,7 +24,7 @@ var downCmd = &cobra.Command{
   - ConfigMaps
   - The project namespace itself
 
-This does NOT remove the built images from Minikube.`,
+This does NOT remove the built images from K3s containerd.`,
 	RunE: runDown,
 }
 
@@ -86,15 +86,16 @@ func runDown(cmd *cobra.Command, args []string) error {
 }
 
 func uninstallHelmRelease(ctx context.Context, appName, namespace string) error {
-	cmd := exec.CommandContext(ctx, "helm", "uninstall", appName, "-n", namespace, "--ignore-not-found")
+	cmd := auth.HelmCommand(ctx, "uninstall", appName, "-n", namespace, "--ignore-not-found")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
 
 func deleteNamespace(ctx context.Context, namespace string) error {
-	cmd := exec.CommandContext(ctx, "kubectl", "delete", "namespace", namespace, "--ignore-not-found")
+	cmd := auth.KubectlCommand(ctx, "delete", "namespace", namespace, "--ignore-not-found")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
+

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 📚 Documentation & Architecture Guide
+    url: https://github.com/saintlionelpraveen/Idlistack-CLI/blob/main/PRODUCTION_ARCHITECTURE.md
+    about: Read the IdliStack 6-Stage Pipeline & Production Architecture documentation before opening an issue.
+  - name: 🔐 Report a Security Vulnerability
+    url: https://github.com/saintlionelpraveen/Idlistack-CLI/blob/main/SECURITY.md
+    about: Please do not file public issues for security vulnerabilities. Follow our Security Policy for private disclosure.

@@ -1,0 +1,10 @@
+# Default owners for everything in the repository
+*       @saintlionelpraveen
+
+# Core CLI & Kubernetes Orchestration
+/cmd/               @saintlionelpraveen
+/internal/          @saintlionelpraveen
+/install.sh         @saintlionelpraveen
+
+# VS Code Extension
+/vscode-extension/  @saintlionelpraveen

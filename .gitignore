@@ -1,0 +1,35 @@
+# IdliStack Local Project State
+.idlistack/
+
+# Release & GoReleaser Artifacts
+dist/
+*.tar.gz
+*.zip
+checksums.txt
+
+# Go Test & Coverage Outputs
+*.out
+coverage.txt
+*.test
+*.prof
+
+# Environment & Secret Files (never commit secrets)
+.env
+.env.*
+*.pem
+*.key
+kubeconfig
+*.kubeconfig
+
+# Editor & OS Files
+.DS_Store
+ThumbsUp.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/settings.json
+.vscode/launch.json
+
+# Node / VS Code Extension Temporary Dependencies
+vscode-extension/node_modules/

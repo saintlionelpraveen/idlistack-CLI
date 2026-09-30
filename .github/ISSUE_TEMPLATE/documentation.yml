@@ -1,0 +1,34 @@
+name: "📚 Documentation or Installer Improvement"
+description: "Report missing/unclear documentation or an issue with the automated install.sh setup script"
+title: "[Docs/Installer]: "
+labels: ["documentation"]
+body:
+  - type: dropdown
+    id: target
+    attributes:
+      label: "Affected File / Guide"
+      options:
+        - "README.md (Quick Start / CLI Reference)"
+        - "PRODUCTION_ARCHITECTURE.md (Architecture Deep Dive)"
+        - "install.sh (Automated Prerequisites & K3s Installer)"
+        - "CONTRIBUTING.md (Developer & Contribution Guide)"
+        - "vscode-extension/README.md (VS Code Extension Docs)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: details
+    attributes:
+      label: "What needs to be added, fixed, or clarified?"
+      description: "Describe the documentation gap or installer issue."
+      placeholder: "In the Quick Start section, when running on Fedora 41..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: "Suggested Improvement (Optional)"
+      description: "If you have specific wording or commands to suggest, include them here."
+    validations:
+      required: false

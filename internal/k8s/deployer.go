@@ -27,6 +27,7 @@ type Deployer struct {
 	namespace  string
 	appName    string // RFC 1123 compliant lowercase name for all K8s resources
 	projectDir string
+	kubeToken  string
 }
 
 // NewDeployer creates a new Deployer instance
@@ -89,6 +90,14 @@ func (d *Deployer) Deploy(ctx context.Context, verbose bool) (string, error) {
 	if err := d.ensureNamespace(ctx); err != nil {
 		return "", err
 	}
+
+	// ─── Verify Keycloak Auth & Bind K3s RBAC (Pre-Helm Gate) ───────
+	k8sToken, kcUser, rbacScope, err := VerifyDeployAuthAndGetToken(ctx, d.namespace)
+	if err != nil {
+		return "", fmt.Errorf("Keycloak RBAC gate blocked Helm deploy: %w", err)
+	}
+	d.kubeToken = k8sToken
+	ui.Detail("Keycloak RBAC verified: user=%s, scope=%s, namespace=%s", color.CyanString(kcUser), color.GreenString(rbacScope), d.namespace)
 
 	// ─── Clean up previous failed deployments ───────────────────────
 	d.cleanupOldDeployment(ctx)
@@ -578,6 +587,13 @@ spec:
 
 // ─── Rollout ────────────────────────────────────────────────────────────
 
+func (d *Deployer) helmCmd(ctx context.Context, args ...string) *exec.Cmd {
+	if d.kubeToken != "" {
+		args = append(args, "--kube-token="+d.kubeToken)
+	}
+	return exec.CommandContext(ctx, "helm", args...)
+}
+
 func (d *Deployer) executeHelmDeploy(ctx context.Context) error {
 	helmDir := filepath.Join(d.projectDir, ".idlistack", "helm")
 
@@ -587,7 +603,7 @@ func (d *Deployer) executeHelmDeploy(ctx context.Context) error {
 	// Helm's deadline fires before Kubernetes finishes probing.
 	helmTimeout := "300s"
 
-	cmd := exec.CommandContext(ctx, "helm", "upgrade", "--install", d.appName, helmDir,
+	cmd := d.helmCmd(ctx, "upgrade", "--install", d.appName, helmDir,
 		"--namespace", d.namespace,
 		"--create-namespace",
 		"--wait", "--timeout", helmTimeout,
@@ -601,7 +617,7 @@ func (d *Deployer) rollback(ctx context.Context) {
 	// Check if there's a prior revision to roll back to.
 	// On a first-install failure, there's no revision 0 — helm rollback
 	// would fail with "release has no 0 version". Use uninstall instead.
-	histCmd := exec.CommandContext(ctx, "helm", "history", d.appName,
+	histCmd := d.helmCmd(ctx, "history", d.appName,
 		"-n", d.namespace, "--max", "2", "-o", "json")
 	output, _ := histCmd.Output()
 
@@ -622,7 +638,7 @@ func (d *Deployer) rollback(ctx context.Context) {
 	}
 
 	if hasDeployedRevision {
-		cmd := exec.CommandContext(ctx, "helm", "rollback", d.appName, "-n", d.namespace)
+		cmd := d.helmCmd(ctx, "rollback", d.appName, "-n", d.namespace)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		cmd.Run()
@@ -630,7 +646,7 @@ func (d *Deployer) rollback(ctx context.Context) {
 		// First install failed — no prior revision to roll back to.
 		// Purge the failed release so the next deploy starts clean.
 		ui.Warn("No previous successful revision — uninstalling failed release...")
-		cmd := exec.CommandContext(ctx, "helm", "uninstall", d.appName,
+		cmd := d.helmCmd(ctx, "uninstall", d.appName,
 			"-n", d.namespace, "--no-hooks")
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
@@ -642,7 +658,7 @@ func (d *Deployer) cleanupOldDeployment(ctx context.Context) {
 	// Check if a previous failed/pending-install release exists.
 	// Helm does NOT natively clean up zombie releases in pending-install
 	// or pending-upgrade state — they block all future deploys.
-	cmd := exec.CommandContext(ctx, "helm", "status", d.appName,
+	cmd := d.helmCmd(ctx, "status", d.appName,
 		"-n", d.namespace, "-o", "json")
 	output, err := cmd.Output()
 	if err != nil {
@@ -662,7 +678,7 @@ func (d *Deployer) cleanupOldDeployment(ctx context.Context) {
 	s := status.Info.Status
 	if s == "pending-install" || s == "pending-upgrade" || s == "failed" {
 		ui.Warn(fmt.Sprintf("Cleaning up stuck release (status: %s)...", s))
-		uninstallCmd := exec.CommandContext(ctx, "helm", "uninstall", d.appName,
+		uninstallCmd := d.helmCmd(ctx, "uninstall", d.appName,
 			"-n", d.namespace, "--no-hooks")
 		uninstallCmd.Stdout = os.Stdout
 		uninstallCmd.Stderr = os.Stderr
@@ -686,7 +702,7 @@ func (d *Deployer) showPodLogs(ctx context.Context) {
 		"--field-selector", "type=Warning", "--sort-by=.metadata.creationTimestamp")
 	if eventsOut, err := eventsCmd.Output(); err == nil && len(strings.TrimSpace(string(eventsOut))) > 0 {
 		fmt.Println()
-		ui.Warn("─── Kubernetes Warning Events ───")
+		ui.Warn("─── K3s Warning Events ───")
 		fmt.Println(string(eventsOut))
 	}
 
@@ -1356,7 +1372,7 @@ func (d *Deployer) syncLocalDockerData(ctx context.Context) {
 		return // Already synced
 	}
 
-	ui.Detail("Detected existing local database container. Dynamically migrating current data to Kubernetes...")
+	ui.Detail("Detected existing local database container. Dynamically migrating current data to K3s...")
 	
 	dbUser, _, dbName := d.extractDbCredentials()
 	if dbUser == "" {
@@ -1382,7 +1398,7 @@ func (d *Deployer) syncLocalDockerData(ctx context.Context) {
 	// Restore
 	restoreCmd := exec.CommandContext(ctx, "bash", "-c", fmt.Sprintf("kubectl exec -i -n %s deployment/db -- psql -U %s -d %s < %s", d.namespace, dbUser, dbName, dumpFile))
 	if err := restoreCmd.Run(); err != nil {
-		ui.Warn("Failed to restore data to Kubernetes: " + err.Error())
+		ui.Warn("Failed to restore data to K3s: " + err.Error())
 		exec.CommandContext(ctx, "kubectl", "scale", "deployment", d.appName, "--replicas=1", "-n", d.namespace).Run()
 		return
 	}
