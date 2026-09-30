@@ -1,0 +1,102 @@
+name: "🐛 Bug Report"
+description: "Report a bug in IdliStack CLI, stack detection, OCI build, K3s/Helm deployment, Web Dashboard, or VS Code Extension"
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug in **IdliStack**! Please fill out the details below so we can reproduce and fix the issue quickly.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: "Affected Component"
+      description: "Which part of IdliStack is experiencing the issue?"
+      options:
+        - "CLI Commands (up, down, init, logs, env)"
+        - "Stack Detection Engine (Railpack / Dynamic Rules)"
+        - "OCI Image Build (Railpack / BuildKit / Dockerfile Fallback)"
+        - "K3s Containerd Sideloading & Helm Deployment"
+        - "Sidecar Databases (PostgreSQL, MySQL/MariaDB, Redis)"
+        - "Interactive Web Dashboard (idlistack status)"
+        - "Keycloak OIDC Auth & K3s RBAC (login, whoami, auth)"
+        - "VS Code Extension (idlistack-vscode)"
+        - "Automated Installer (install.sh)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: "What happened?"
+      description: "A clear and concise description of the bug and what you expected to happen instead."
+      placeholder: "When running `idlistack up` on a Next.js + PostgreSQL project, the build succeeds but..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: "Steps to Reproduce"
+      description: "Minimal steps to reproduce the behavior."
+      placeholder: |
+        1. Navigate to a project with `package.json`...
+        2. Run `idlistack up --verbose`
+        3. Observe error at Stage 4/6...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: "CLI Output / Build Plan / Logs"
+      description: "Paste the output of `idlistack up --verbose` or `idlistack up --inspect` (please redact any secrets)."
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: cli_version
+    attributes:
+      label: "IdliStack Version"
+      description: "Output of `idlistack version`"
+      placeholder: "v1.8.1 (or commit hash)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: "Operating System / Platform"
+      options:
+        - "Ubuntu / Debian Linux"
+        - "Fedora / RHEL / Rocky Linux"
+        - "Arch Linux"
+        - "Windows (WSL2)"
+        - "macOS (Apple Silicon / Intel)"
+        - "Other Linux Distribution"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: k8s_distro
+    attributes:
+      label: "Kubernetes Distribution"
+      options:
+        - "K3s (Default)"
+        - "Minikube"
+        - "Kind"
+        - "Docker Desktop Kubernetes"
+        - "Other"
+    validations:
+      required: true
+
+  - type: input
+    id: app_stack
+    attributes:
+      label: "Target Application Stack / Language"
+      description: "What framework or language were you deploying?"
+      placeholder: "e.g., Node.js 22 (Next.js), Python (FastAPI), PHP (Laravel), Ghost CMS, Go"
+    validations:
+      required: false

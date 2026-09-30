@@ -27,7 +27,7 @@ var (
 var statusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Show the current deployment status and launch interactive web dashboard",
-	Long: `Displays the application's Kubernetes deployment status, pods, and service URL.
+	Long: `Displays the application's K3s deployment status, pods, and service URL.
 
 By default, launches an interactive web dashboard in your default browser where you
 can view live status, stream logs, restart, and stop/start your application.

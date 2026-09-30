@@ -1,0 +1,94 @@
+# GoReleaser configuration for IdliStack CLI
+# Documentation: https://goreleaser.com
+version: 2
+
+project_name: idlistack
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+
+builds:
+  - id: idlistack
+    main: ./main.go
+    binary: idlistack
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+    ldflags:
+      - -s -w
+      - -X github.com/idlistack/cli/cmd.Version={{.Version}}
+
+archives:
+  - id: idlistack-archive
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    format_overrides:
+      - goos: windows
+        formats: ['zip']
+    files:
+      - LICENSE
+      - README.md
+      - CHANGELOG.md
+      - install.sh
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^doc:"
+      - "^test:"
+      - "^chore:"
+      - Merge pull request
+      - Merge branch
+  groups:
+    - title: "🚀 Features"
+      regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
+      order: 0
+    - title: "🐛 Bug Fixes"
+      regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
+      order: 1
+    - title: "⚡ Refactoring & Performance"
+      regexp: '^.*?refactor(\([[:word:]]+\))??!?:.+$'
+      order: 2
+    - title: "📦 Other Changes"
+      order: 999
+
+release:
+  github:
+    owner: saintlionelpraveen
+    name: Idlistack-CLI
+  draft: false
+  prerelease: auto
+  name_template: "IdliStack CLI {{.Tag}}"
+  header: |
+    ## 🚀 IdliStack CLI {{ .Tag }}
+
+    Zero-configuration Kubernetes deployment CLI & VS Code Extension powered by **Railpack (BuildKit)**, **Helm v3**, and **K3s**.
+
+    ### ⚡ Quick Install / Upgrade
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/saintlionelpraveen/Idlistack-CLI/main/install.sh | bash
+    ```
+  footer: |
+    ---
+    **Full Changelog**: https://github.com/saintlionelpraveen/Idlistack-CLI/compare/{{ .PreviousTag }}...{{ .Tag }}

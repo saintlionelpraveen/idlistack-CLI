@@ -1,5 +1,12 @@
 # IdliStack CLI & VS Code Extension
 
+[![Latest Release](https://img.shields.io/github/v/release/saintlionelpraveen/Idlistack-CLI?include_prereleases&style=flat-square&logo=github&label=Release)](https://github.com/saintlionelpraveen/Idlistack-CLI/releases)
+[![CI Build & Test](https://img.shields.io/github/actions/workflow/status/saintlionelpraveen/Idlistack-CLI/ci.yml?branch=main&style=flat-square&logo=githubactions&label=CI)](https://github.com/saintlionelpraveen/Idlistack-CLI/actions)
+[![Go Version](https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat-square&logo=go)](https://go.dev/)
+[![Kubernetes](https://img.shields.io/badge/Kubernetes-K3s%20%7C%20Helm%20v3-326CE5?style=flat-square&logo=kubernetes&logoColor=white)](https://k3s.io/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)](CONTRIBUTING.md)
+
 > **Deploy any application to Kubernetes with zero configuration.**
 > Powered by **Go**, **Railpack (BuildKit)**, **Docker**, **Helm**, and **K3s**.
 
@@ -201,13 +208,35 @@ NODE_ENV = "production"
 ## Local steps to setup
 
 ### 1. One-Line Setup (Remote or from GitHub)
+```bash
 curl -fsSL https://raw.githubusercontent.com/saintlionelpraveen/Idlistack-CLI/main/install.sh | bash
+```
 
 ### 2. Local Setup (From Cloned Repo)
+```bash
 chmod +x ./install.sh
 ./install.sh
+```
 
 ---
+
+## Contributing & Open Source Community
+
+We welcome contributions of all kinds — from adding new stack detection rules to improving the K3s/Helm deployer, Web Dashboard, or VS Code extension!
+
+- **Contributing Guide:** Read [CONTRIBUTING.md](CONTRIBUTING.md) for local setup, architecture overview, branch conventions, and PR workflow.
+- **Raise an Issue:**
+  - [🐛 Report a Bug](https://github.com/saintlionelpraveen/Idlistack-CLI/issues/new?template=bug_report.yml)
+  - [✨ Request a Feature or New Stack](https://github.com/saintlionelpraveen/Idlistack-CLI/issues/new?template=feature_request.yml)
+  - [📚 Documentation / Installer Feedback](https://github.com/saintlionelpraveen/Idlistack-CLI/issues/new?template=documentation.yml)
+- **Pull Request Format:** All PRs automatically use our structured [Pull Request Template](.github/PULL_REQUEST_TEMPLATE.md).
+- **Release History:** See [CHANGELOG.md](CHANGELOG.md) and [GitHub Releases](https://github.com/saintlionelpraveen/Idlistack-CLI/releases).
+- **Security Policy:** See [SECURITY.md](SECURITY.md) for responsible vulnerability disclosure.
+- **Code of Conduct:** See [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+
+---
+
 ## License
 
-MIT License &bull; Copyright (c) 2026 T4GC / IdliStack Team
+Licensed under the [MIT License](LICENSE) &bull; Copyright (c) 2026 T4GC / IdliStack Team
+

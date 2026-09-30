@@ -3,10 +3,10 @@ package cmd
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 
 	"github.com/fatih/color"
+	"github.com/idlistack/cli/internal/auth"
 	"github.com/idlistack/cli/internal/config"
 	"github.com/idlistack/cli/internal/ui"
 	"github.com/spf13/cobra"
@@ -15,7 +15,7 @@ import (
 var logsCmd = &cobra.Command{
 	Use:   "logs",
 	Short: "Stream live logs from the deployed application",
-	Long: `Streams real-time logs from the application's pods in Kubernetes.
+	Long: `Streams real-time logs from the application's pods in K3s.
 
 Equivalent to 'kubectl logs -f' but automatically targets the correct
 namespace and deployment for the current IdliStack project.`,
@@ -61,10 +61,11 @@ func runLogs(cmd *cobra.Command, args []string) error {
 		kubectlArgs = append(kubectlArgs, "-f")
 	}
 
-	kubectlCmd := exec.CommandContext(cmd.Context(), "kubectl", kubectlArgs...)
+	kubectlCmd := auth.KubectlCommand(cmd.Context(), kubectlArgs...)
 	kubectlCmd.Stdout = os.Stdout
 	kubectlCmd.Stderr = os.Stderr
 	kubectlCmd.Stdin = os.Stdin
 
 	return kubectlCmd.Run()
 }
+

@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/fatih/color"
+	"github.com/idlistack/cli/internal/auth"
 	"github.com/idlistack/cli/internal/config"
 	"github.com/idlistack/cli/internal/detect"
 	"github.com/idlistack/cli/internal/ui"
@@ -154,6 +155,11 @@ buildplan.json
 	if f, err := os.OpenFile(projectGitignore, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
 		defer f.Close()
 		f.WriteString("\n# IdliStack\n.idlistack/\n")
+	}
+
+	targetNS := fmt.Sprintf("idlistack-%s", strings.ToLower(projectName))
+	if creds, err := auth.VerifyAndAuthorize(cmd.Context(), targetNS); err == nil && creds != nil {
+		ui.Detail("Bound namespace %s to Keycloak user %s (RBAC: %s)", color.CyanString(targetNS), color.CyanString(creds.Username), color.GreenString(creds.Scope))
 	}
 
 	ui.Success(fmt.Sprintf("Project %s initialized!", color.CyanString(projectName)))

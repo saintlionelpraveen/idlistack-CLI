@@ -52,10 +52,33 @@ function resolveCliPath(extensionPath) {
 }
 
 /**
+ * Reads ~/.idlistack/credentials.json and returns active Keycloak + K3s RBAC session if valid
+ */
+function getActiveKeycloakSession() {
+    try {
+        const credPath = path.join(os.homedir(), '.idlistack', 'credentials.json');
+        if (!fs.existsSync(credPath)) {
+            return null;
+        }
+        const raw = fs.readFileSync(credPath, 'utf8');
+        const creds = JSON.parse(raw);
+        if (!creds || !creds.username || !creds.accessToken) {
+            return null;
+        }
+        if (creds.expiresAt && new Date(creds.expiresAt).getTime() < Date.now()) {
+            return null;
+        }
+        return creds;
+    } catch (_) {
+        return null;
+    }
+}
+
+/**
  * @param {vscode.ExtensionContext} context
  */
 function activate(context) {
-    console.log('IdliStack extension v1.8.0 active!');
+    console.log('IdliStack extension v1.9.0 active (Keycloak + K3s RBAC enabled)!');
 
     const binDir = path.join(context.extensionPath, 'bin');
     const isWin = os.platform() === 'win32';
@@ -73,7 +96,6 @@ function activate(context) {
     }
 
     // 2. Global Terminal PATH Injection:
-    // Injects both system bin paths and the extension bin directory into every integrated terminal!
     if (context.environmentVariableCollection) {
         context.environmentVariableCollection.prepend('PATH', `${usrLocalBin}${path.delimiter}${userLocalBin}${path.delimiter}${binDir}${path.delimiter}`);
         context.environmentVariableCollection.description = 'IdliStack CLI binary paths';
@@ -142,6 +164,89 @@ function activate(context) {
         return terminal;
     }
 
+    // Persistent Status Bar Item (reflects Keycloak login & K3s RBAC state)
+    const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+    statusBarItem.command = 'idlistack.menu';
+
+    function updateStatusBar() {
+        const session = getActiveKeycloakSession();
+        if (session) {
+            const scopeLabel = session.scope === 'cluster-wide' ? 'Cluster RBAC' : 'NS RBAC';
+            statusBarItem.text = `$(shield) IdliStack (${session.username} • ${scopeLabel})`;
+            statusBarItem.tooltip = `IdliStack Authenticated via Keycloak\nUser: ${session.username}\nScope: ${session.scope}\nGroups: ${(session.groups || []).join(', ')}`;
+        } else {
+            statusBarItem.text = '$(lock) IdliStack (Login Required)';
+            statusBarItem.tooltip = 'IdliStack: Click to authenticate with Keycloak & K3s RBAC';
+        }
+        statusBarItem.show();
+    }
+    updateStatusBar();
+    const statusInterval = setInterval(updateStatusBar, 3000);
+    context.subscriptions.push({ dispose: () => clearInterval(statusInterval) });
+
+    /**
+     * Checks if user is authenticated with Keycloak before running protected commands.
+     * If not logged in, prompts to open the Auth Frontend or Terminal Login.
+     */
+    async function ensureAuthenticatedBeforeCommand() {
+        const session = getActiveKeycloakSession();
+        if (session) {
+            return true;
+        }
+        const choice = await vscode.window.showWarningMessage(
+            'IdliStack: Keycloak authentication is required before accessing K3s cluster commands.',
+            'Login (Web Auth UI)',
+            'Login (Terminal)',
+            'Deploy Keycloak to K3s'
+        );
+        if (choice === 'Login (Web Auth UI)') {
+            vscode.commands.executeCommand('idlistack.login');
+        } else if (choice === 'Login (Terminal)') {
+            const cli = resolveCliPath(context.extensionPath);
+            const terminal = getTerminal();
+            terminal.sendText(`"${cli}" login --cli`);
+        } else if (choice === 'Deploy Keycloak to K3s') {
+            vscode.commands.executeCommand('idlistack.authSetup');
+        }
+        return false;
+    }
+
+    // Command: idlistack.login (Opens Keycloak Auth Frontend UI)
+    let loginDisposable = vscode.commands.registerCommand('idlistack.login', function () {
+        const rootPath = getWorkspaceRoot();
+        const cli = resolveCliPath(context.extensionPath);
+        const terminal = getTerminal();
+        if (rootPath) {
+            terminal.sendText(`cd "${rootPath}"`);
+        }
+        terminal.sendText(`"${cli}" login`);
+        vscode.window.showInformationMessage('IdliStack: Launching Keycloak & K3s RBAC Authentication Frontend...');
+    });
+
+    // Command: idlistack.authSetup (Deploys Keycloak inside K3s idlistack-auth namespace)
+    let authSetupDisposable = vscode.commands.registerCommand('idlistack.authSetup', function () {
+        const cli = resolveCliPath(context.extensionPath);
+        const terminal = getTerminal();
+        terminal.sendText(`"${cli}" auth setup`);
+        vscode.window.showInformationMessage('IdliStack: Deploying Keycloak inside local K3s cluster (namespace: idlistack-auth)...');
+    });
+
+    // Command: idlistack.whoami
+    let whoamiDisposable = vscode.commands.registerCommand('idlistack.whoami', function () {
+        const cli = resolveCliPath(context.extensionPath);
+        const terminal = getTerminal();
+        terminal.sendText(`"${cli}" whoami`);
+    });
+
+    // Command: idlistack.logout
+    let logoutDisposable = vscode.commands.registerCommand('idlistack.logout', function () {
+        const cli = resolveCliPath(context.extensionPath);
+        const terminal = getTerminal();
+        terminal.sendText(`"${cli}" logout`);
+        setTimeout(updateStatusBar, 800);
+        vscode.window.showInformationMessage('IdliStack: Logged out from Keycloak session.');
+    });
+
     // Command: idlistack.terminal (Opens dedicated terminal with idlistack pre-configured)
     let terminalDisposable = vscode.commands.registerCommand("idlistack.terminal", function () {
         const rootPath = getWorkspaceRoot();
@@ -154,13 +259,14 @@ function activate(context) {
             }
         });
         terminal.show(true);
-        terminal.sendText('echo "🚀 IdliStack Terminal ready! You can now run \\"idlistack init\\", \\"idlistack up\\", \\"idlistack status\\", etc."');
+        terminal.sendText('echo "🚀 IdliStack Terminal ready! Run \\"idlistack login\\", \\"idlistack init\\", \\"idlistack up\\", etc."');
     });
 
     // Command: idlistack.init
-    let initDisposable = vscode.commands.registerCommand("idlistack.init", function () {
+    let initDisposable = vscode.commands.registerCommand("idlistack.init", async function () {
         const rootPath = getWorkspaceRoot();
         if (!rootPath) return;
+        if (!(await ensureAuthenticatedBeforeCommand())) return;
         const cli = resolveCliPath(context.extensionPath);
         const terminal = getTerminal();
         terminal.sendText(`cd "${rootPath}"`);
@@ -168,9 +274,10 @@ function activate(context) {
     });
 
     // Command: idlistack.inspect (Inspect stack, version, framework & plan preview)
-    let inspectDisposable = vscode.commands.registerCommand("idlistack.inspect", function () {
+    let inspectDisposable = vscode.commands.registerCommand("idlistack.inspect", async function () {
         const rootPath = getWorkspaceRoot();
         if (!rootPath) return;
+        if (!(await ensureAuthenticatedBeforeCommand())) return;
         const cli = resolveCliPath(context.extensionPath);
         const terminal = getTerminal();
         terminal.sendText(`cd "${rootPath}"`);
@@ -179,9 +286,10 @@ function activate(context) {
     });
 
     // Command: idlistack.up (Deploy to K3s)
-    let upDisposable = vscode.commands.registerCommand('idlistack.up', function () {
+    let upDisposable = vscode.commands.registerCommand('idlistack.up', async function () {
         const rootPath = getWorkspaceRoot();
         if (!rootPath) return;
+        if (!(await ensureAuthenticatedBeforeCommand())) return;
 
         const cli = resolveCliPath(context.extensionPath);
         const terminal = getTerminal();
@@ -193,13 +301,14 @@ function activate(context) {
         } else {
             terminal.sendText(`"${cli}" up`);
         }
-        vscode.window.showInformationMessage('IdliStack: Building OCI image & deploying to K3s...');
+        vscode.window.showInformationMessage('IdliStack: Verifying Keycloak RBAC, building OCI image & deploying via Helm to K3s...');
     });
 
     // Command: idlistack.down (Destroy)
-    let downDisposable = vscode.commands.registerCommand('idlistack.down', function () {
+    let downDisposable = vscode.commands.registerCommand('idlistack.down', async function () {
         const rootPath = getWorkspaceRoot();
         if (!rootPath) return;
+        if (!(await ensureAuthenticatedBeforeCommand())) return;
 
         const cli = resolveCliPath(context.extensionPath);
         const terminal = getTerminal();
@@ -208,9 +317,10 @@ function activate(context) {
     });
 
     // Command: idlistack.status
-    let statusDisposable = vscode.commands.registerCommand('idlistack.status', function () {
+    let statusDisposable = vscode.commands.registerCommand('idlistack.status', async function () {
         const rootPath = getWorkspaceRoot();
         if (!rootPath) return;
+        if (!(await ensureAuthenticatedBeforeCommand())) return;
 
         const cli = resolveCliPath(context.extensionPath);
         const terminal = getTerminal();
@@ -219,9 +329,10 @@ function activate(context) {
     });
 
     // Command: idlistack.logs
-    let logsDisposable = vscode.commands.registerCommand('idlistack.logs', function () {
+    let logsDisposable = vscode.commands.registerCommand('idlistack.logs', async function () {
         const rootPath = getWorkspaceRoot();
         if (!rootPath) return;
+        if (!(await ensureAuthenticatedBeforeCommand())) return;
 
         const cli = resolveCliPath(context.extensionPath);
         const terminal = getTerminal();
@@ -231,17 +342,28 @@ function activate(context) {
 
     // Status bar quick pick menu
     let menuDisposable = vscode.commands.registerCommand('idlistack.menu', async function () {
+        const session = getActiveKeycloakSession();
+        const authDesc = session
+            ? `Logged in as ${session.username} (${session.scope})`
+            : 'Authenticate with Keycloak in K3s (Web Frontend)';
+
         const items = [
-            { label: '$(cloud-upload) Deploy to K3s', description: 'Detect stack, build OCI image & deploy', cmd: 'idlistack.up' },
+            { label: '$(shield) Login with Keycloak (Auth Frontend)', description: authDesc, cmd: 'idlistack.login' },
+            { label: '$(key) Deploy Keycloak Auth Layer to K3s', description: 'Deploy Keycloak inside K3s (idlistack-auth)', cmd: 'idlistack.authSetup' },
+            { label: '$(account) Check Auth & RBAC Scope (Whoami)', description: 'Show active Keycloak user, groups & namespaces', cmd: 'idlistack.whoami' },
+            { label: '$(cloud-upload) Deploy to K3s', description: 'Verify RBAC, build OCI image & deploy via Helm', cmd: 'idlistack.up' },
             { label: '$(search) Inspect Stack & Plan', description: 'Preview stack, version, framework & build plan', cmd: 'idlistack.inspect' },
             { label: '$(terminal) Open IdliStack Terminal', description: 'Open terminal with idlistack CLI pre-configured', cmd: 'idlistack.terminal' },
-            { label: '$(server-environment) Check Status', description: 'Check running pods & service URL', cmd: 'idlistack.status' },
+            { label: '$(server-environment) Check Status', description: 'Check running pods & launch web dashboard', cmd: 'idlistack.status' },
             { label: '$(terminal) View Logs', description: 'Stream container logs from K3s', cmd: 'idlistack.logs' },
-            { label: '$(trash) Destroy Deployment', description: 'Uninstall Helm release from K3s', cmd: 'idlistack.down' }
+            { label: '$(trash) Destroy Deployment', description: 'Uninstall Helm release from K3s', cmd: 'idlistack.down' },
+            { label: '$(sign-out) Logout from Keycloak', description: 'Clear saved Keycloak token & RBAC session', cmd: 'idlistack.logout' }
         ];
 
         const selection = await vscode.window.showQuickPick(items, {
-            placeHolder: 'Select an IdliStack action'
+            placeHolder: session
+                ? `IdliStack — Authenticated as ${session.username} (${session.scope.toUpperCase()})`
+                : 'IdliStack — Login with Keycloak required before deploying'
         });
 
         if (selection && selection.cmd) {
@@ -249,30 +371,27 @@ function activate(context) {
         }
     });
 
-    // Persistent Status Bar Item (Visible immediately on launch)
-    const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
-    statusBarItem.text = '$(rocket) IdliStack';
-    statusBarItem.tooltip = 'IdliStack: Zero-Config Deployment on K3s (Click for actions)';
-    statusBarItem.command = 'idlistack.menu';
-    statusBarItem.show();
-
     // Welcome Notification on First Install
-    const welcomed = context.globalState.get('idlistack.welcomed_v180');
+    const welcomed = context.globalState.get('idlistack.welcomed_v190');
     if (!welcomed) {
-        context.globalState.update('idlistack.welcomed_v180', true);
+        context.globalState.update('idlistack.welcomed_v190', true);
         vscode.window.showInformationMessage(
-            'IdliStack v1.8.0 is ready! Terminal commands are now available.',
-            'Open Terminal',
-            'Deploy to K3s',
-            'Inspect Stack'
+            'IdliStack v1.9.0 is ready with Keycloak OIDC & K3s RBAC authentication!',
+            'Login with Keycloak',
+            'Deploy Keycloak to K3s',
+            'Open Terminal'
         ).then(selection => {
+            if (selection === 'Login with Keycloak') vscode.commands.executeCommand('idlistack.login');
+            if (selection === 'Deploy Keycloak to K3s') vscode.commands.executeCommand('idlistack.authSetup');
             if (selection === 'Open Terminal') vscode.commands.executeCommand('idlistack.terminal');
-            if (selection === 'Deploy to K3s') vscode.commands.executeCommand('idlistack.up');
-            if (selection === 'Inspect Stack') vscode.commands.executeCommand('idlistack.inspect');
         });
     }
 
     context.subscriptions.push(
+        loginDisposable,
+        authSetupDisposable,
+        whoamiDisposable,
+        logoutDisposable,
         terminalDisposable,
         initDisposable,
         inspectDisposable,

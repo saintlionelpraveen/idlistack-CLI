@@ -1,0 +1,59 @@
+name: "✨ Feature Request / New Stack Support"
+description: "Suggest a new CLI feature, framework detection rule, sidecar service, dashboard enhancement, or VS Code command"
+title: "[Feat]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have an idea to make **IdliStack** even better, or want zero-config support for a new framework or database? Share your proposal below!
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: "Feature Category"
+      options:
+        - "🔍 New Language / Framework Detection Rule"
+        - "🗄️ New Sidecar Database / Cache Service (e.g., MongoDB, RabbitMQ, MinIO)"
+        - "🚀 CLI Command / Flag Enhancement"
+        - "🖥️ Interactive Web Dashboard Feature (idlistack status)"
+        - "🧩 VS Code Extension Feature"
+        - "🔐 Keycloak Auth / Multi-Tenant RBAC Enhancement"
+        - "☸️ Kubernetes / Helm / Ingress Configuration"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: "Problem Statement / Use Case"
+      description: "What problem does this feature solve, or what workflow are you trying to achieve?"
+      placeholder: "Currently, deploying a Django + Celery + Redis worker requires manual configuration because..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: "Proposed Solution"
+      description: "Describe how you envision this working (CLI commands, `idlistack.toml` options, or detection files)."
+      placeholder: |
+        Detect `manage.py` + `celery` in `requirements.txt` and automatically configure...
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: "Alternatives Considered (Optional)"
+      description: "Any workarounds or alternative designs you have considered."
+      placeholder: "Using a custom Dockerfile in Layer 0..."
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: "Willingness to Contribute"
+      options:
+        - label: "I would like to submit a Pull Request to implement this feature!"

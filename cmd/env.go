@@ -3,10 +3,10 @@ package cmd
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 
 	"github.com/fatih/color"
+	"github.com/idlistack/cli/internal/auth"
 	"github.com/idlistack/cli/internal/config"
 	"github.com/idlistack/cli/internal/ui"
 	"github.com/spf13/cobra"
@@ -64,15 +64,15 @@ func runEnvSet(cmd *cobra.Command, args []string) error {
 	}
 
 	// Ensure namespace exists
-	exec.CommandContext(ctx, "kubectl", "create", "namespace", namespace, "--dry-run=client", "-o", "yaml").
+	auth.KubectlCommand(ctx, "create", "namespace", namespace, "--dry-run=client", "-o", "yaml").
 		Output()
 
 	// Create or update the secret
 	deleteArgs := []string{"delete", "secret", secretName, "-n", namespace, "--ignore-not-found"}
-	exec.CommandContext(ctx, "kubectl", deleteArgs...).Run()
+	auth.KubectlCommand(ctx, deleteArgs...).Run()
 
 	createArgs := append([]string{"create", "secret", "generic", secretName, "-n", namespace}, literals...)
-	createCmd := exec.CommandContext(ctx, "kubectl", createArgs...)
+	createCmd := auth.KubectlCommand(ctx, createArgs...)
 	if err := createCmd.Run(); err != nil {
 		return fmt.Errorf("failed to set env vars: %w", err)
 	}
@@ -96,7 +96,7 @@ func runEnvList(cmd *cobra.Command, args []string) error {
 	namespace := fmt.Sprintf("idlistack-%s", cfg.Project.Name)
 	secretName := fmt.Sprintf("%s-env", cfg.Project.Name)
 
-	getCmd := exec.CommandContext(cmd.Context(), "kubectl", "get", "secret", secretName,
+	getCmd := auth.KubectlCommand(cmd.Context(), "get", "secret", secretName,
 		"-n", namespace, "-o", "jsonpath={.data}")
 	output, err := getCmd.Output()
 	if err != nil {
@@ -114,7 +114,7 @@ func runEnvList(cmd *cobra.Command, args []string) error {
 	}
 
 	// Use kubectl to get decoded values
-	descCmd := exec.CommandContext(cmd.Context(), "kubectl", "get", "secret", secretName,
+	descCmd := auth.KubectlCommand(cmd.Context(), "get", "secret", secretName,
 		"-n", namespace, "-o", "go-template={{range $k,$v := .data}}{{$k}}={{$v | base64decode}}\n{{end}}")
 	descCmd.Stdout = os.Stdout
 	descCmd.Stderr = os.Stderr
@@ -125,3 +125,4 @@ func runEnvDelete(cmd *cobra.Command, args []string) error {
 	ui.Warn("To delete env vars, use 'idlistack env set' with the remaining vars, or delete the secret entirely.")
 	return nil
 }
+
