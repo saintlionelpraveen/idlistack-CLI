@@ -296,12 +296,102 @@ func RefreshSession(ctx context.Context, creds *Credentials) (*Credentials, erro
 	return BuildAndSaveCredentialsFromTokens(ctx, creds.KeycloakURL, creds.Realm, creds.ClientID, tokResp.AccessToken, tokResp.IDToken, tokResp.RefreshToken, tokResp.ExpiresIn, creds.AllowedNamespaces)
 }
 
-// VerifyAndAuthorize checks that a user is logged in via Keycloak, refreshes their token if expired,
+// ValidateKeycloakSession checks if the user still exists and their token is still valid with Keycloak.
+// If the user was deleted, disabled, or session revoked in Keycloak, it clears the local credentials
+// and returns an error forcing re-authentication.
+func ValidateKeycloakSession(ctx context.Context, creds *Credentials) error {
+	if creds == nil || creds.AccessToken == "" || creds.KeycloakURL == "" {
+		return fmt.Errorf("no active session")
+	}
+
+	kcURL := strings.TrimSuffix(creds.KeycloakURL, "/")
+	userInfoURL := fmt.Sprintf("%s/realms/%s/protocol/openid-connect/userinfo", kcURL, creds.Realm)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, userInfoURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
+
+	client := &http.Client{Timeout: 4 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		// Keycloak may be briefly unreachable; if local expiration is still valid, don't hard-fail on network glitch
+		return nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusNotFound {
+		// Attempt token refresh first if refresh token is available
+		if creds.RefreshToken != "" {
+			if refreshed, refErr := RefreshSession(ctx, creds); refErr == nil && refreshed != nil {
+				*creds = *refreshed
+				return nil
+			}
+		}
+		// Token rejected and refresh failed -> user deleted or revoked in Keycloak!
+		_ = ClearCredentials()
+		return fmt.Errorf("user %q was deleted or session was revoked in Keycloak; please run 'idlistack login'", creds.Username)
+	}
+
+	return nil
+}
+
+// UserExistsInKeycloak checks if a specific username exists in the Keycloak idlistack realm.
+func UserExistsInKeycloak(ctx context.Context, username string) bool {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return false
+	}
+	kcURL := k8s.GetKeycloakBaseURL(ctx)
+	adminUser, adminPass := k8s.GetKeycloakAdminCredentials(ctx)
+	if adminUser == "" {
+		adminUser = "admin"
+	}
+	if adminPass == "" {
+		adminPass = "admin"
+	}
+
+	adminTokenURL := fmt.Sprintf("%s/realms/master/protocol/openid-connect/token", kcURL)
+	form := url.Values{}
+	form.Set("client_id", "admin-cli")
+	form.Set("grant_type", "password")
+	form.Set("username", adminUser)
+	form.Set("password", adminPass)
+
+	client := &http.Client{Timeout: 4 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, adminTokenURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	var adminTok oidcTokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&adminTok); err != nil || adminTok.AccessToken == "" {
+		return false
+	}
+
+	return findKeycloakUserID(ctx, client, kcURL, adminTok.AccessToken, username) != ""
+}
+
+// VerifyAndAuthorize checks that a user is logged in via Keycloak, actively validates that the user
+// still exists in Keycloak (has not been deleted), refreshes their token if expired,
 // and verifies RBAC authorization for the target namespace (if provided).
 func VerifyAndAuthorize(ctx context.Context, targetNamespace string) (*Credentials, error) {
 	creds, err := LoadCredentials()
 	if err != nil {
 		return nil, fmt.Errorf("authentication required: please log in first with 'idlistack login'")
+	}
+
+	// Active Keycloak validation: verify user was not deleted or revoked in Keycloak
+	if valErr := ValidateKeycloakSession(ctx, creds); valErr != nil {
+		return nil, valErr
 	}
 
 	if time.Now().After(creds.ExpiresAt) {
@@ -404,19 +494,26 @@ func CreateKeycloakUser(ctx context.Context, username, email, password, role, ta
 		return fmt.Errorf("username and password are required")
 	}
 	if email == "" {
-		email = fmt.Sprintf("%s@idlistack.local", strings.ToLower(username))
+		email = fmt.Sprintf("%s@%s.local", strings.ToLower(username), k8s.KeycloakRealm)
 	}
 
 	kcURL := k8s.GetKeycloakBaseURL(ctx)
 	client := &http.Client{Timeout: 10 * time.Second}
 
-	// 1. Obtain Keycloak Master Admin Token
+	// 1. Obtain Keycloak Master Admin Token dynamically from cluster secret or environment
+	adminUser, adminPass := k8s.GetKeycloakAdminCredentials(ctx)
+	if adminUser == "" {
+		adminUser = "admin"
+	}
+	if adminPass == "" {
+		adminPass = "admin"
+	}
 	adminTokenURL := fmt.Sprintf("%s/realms/master/protocol/openid-connect/token", kcURL)
 	form := url.Values{}
 	form.Set("client_id", "admin-cli")
 	form.Set("grant_type", "password")
-	form.Set("username", "admin")
-	form.Set("password", "admin")
+	form.Set("username", adminUser)
+	form.Set("password", adminPass)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, adminTokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
