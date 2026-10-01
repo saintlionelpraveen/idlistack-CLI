@@ -3,11 +3,15 @@ package k8s
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,12 +19,138 @@ import (
 	"github.com/idlistack/cli/internal/ui"
 )
 
-const (
-	KeycloakNamespace = "idlistack-auth"
-	KeycloakNodePort  = 30080
-	KeycloakRealm     = "idlistack"
-	KeycloakClientID  = "idlistack-cli"
+var (
+	KeycloakNamespace   = getEnvOrDefault("IDLISTACK_KEYCLOAK_NAMESPACE", "idlistack-auth")
+	KeycloakNodePort    = getEnvIntOrDefault("IDLISTACK_KEYCLOAK_NODEPORT", 30080)
+	KeycloakHTTPPort    = getEnvIntOrDefault("IDLISTACK_KEYCLOAK_HTTP_PORT", 8080)
+	KeycloakRealm       = getEnvOrDefault("IDLISTACK_KEYCLOAK_REALM", "idlistack")
+	KeycloakClientID    = getEnvOrDefault("IDLISTACK_KEYCLOAK_CLIENT_ID", "idlistack-cli")
+	KeycloakImage       = getEnvOrDefault("IDLISTACK_KEYCLOAK_IMAGE", "quay.io/keycloak/keycloak:24.0")
+	KeycloakAdminSecret = getEnvOrDefault("IDLISTACK_KEYCLOAK_ADMIN_SECRET", "keycloak-admin-secret")
 )
+
+// KeycloakUserSeed represents an optional initial user to seed into the realm
+type KeycloakUserSeed struct {
+	Username  string
+	Email     string
+	FirstName string
+	LastName  string
+	Password  string
+	Groups    []string
+}
+
+// KeycloakDeployConfig holds dynamic parameters for deploying Keycloak to K3s
+type KeycloakDeployConfig struct {
+	Namespace     string
+	Realm         string
+	ClientID      string
+	Image         string
+	HTTPPort      int
+	NodePort      int
+	Replicas      int
+	TokenLifespan int
+	AdminUser     string
+	AdminPassword string
+	InitialUsers  []KeycloakUserSeed
+}
+
+func getEnvOrDefault(key, fallback string) string {
+	if val := strings.TrimSpace(os.Getenv(key)); val != "" {
+		return val
+	}
+	return fallback
+}
+
+func getEnvIntOrDefault(key string, fallback int) int {
+	if val := strings.TrimSpace(os.Getenv(key)); val != "" {
+		if parsed, err := strconv.Atoi(val); err == nil && parsed > 0 {
+			return parsed
+		}
+	}
+	return fallback
+}
+
+func generateRandomPassword(bytesLen int) string {
+	b := make([]byte, bytesLen)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("kc-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
+
+// DefaultKeycloakDeployConfig builds a dynamic configuration from environment variables and existing cluster state
+func DefaultKeycloakDeployConfig(ctx context.Context) KeycloakDeployConfig {
+	adminUser, adminPass := GetKeycloakAdminCredentials(ctx)
+	if adminUser == "" {
+		adminUser = getEnvOrDefault("IDLISTACK_KEYCLOAK_ADMIN", "admin")
+	}
+	if adminPass == "" {
+		adminPass = getEnvOrDefault("IDLISTACK_KEYCLOAK_ADMIN_PASSWORD", "")
+		if adminPass == "" {
+			adminPass = generateRandomPassword(12)
+		}
+	}
+	return KeycloakDeployConfig{
+		Namespace:     KeycloakNamespace,
+		Realm:         KeycloakRealm,
+		ClientID:      KeycloakClientID,
+		Image:         KeycloakImage,
+		HTTPPort:      KeycloakHTTPPort,
+		NodePort:      KeycloakNodePort,
+		Replicas:      getEnvIntOrDefault("IDLISTACK_KEYCLOAK_REPLICAS", 1),
+		TokenLifespan: getEnvIntOrDefault("IDLISTACK_KEYCLOAK_TOKEN_LIFESPAN", 86400),
+		AdminUser:     adminUser,
+		AdminPassword: adminPass,
+	}
+}
+
+// GetKeycloakAdminCredentials dynamically retrieves the Keycloak master admin username and password
+// from environment variables, the in-cluster Kubernetes Secret, or the running deployment.
+func GetKeycloakAdminCredentials(ctx context.Context) (string, string) {
+	envUser := strings.TrimSpace(os.Getenv("IDLISTACK_KEYCLOAK_ADMIN"))
+	envPass := strings.TrimSpace(os.Getenv("IDLISTACK_KEYCLOAK_ADMIN_PASSWORD"))
+	if envUser != "" && envPass != "" {
+		return envUser, envPass
+	}
+
+	EnsureK3sContext(ctx)
+
+	// 1. Check Kubernetes Secret in KeycloakNamespace
+	secCmd := exec.CommandContext(ctx, "kubectl", "get", "secret", KeycloakAdminSecret, "-n", KeycloakNamespace,
+		"-o", "jsonpath={.data.KEYCLOAK_ADMIN}:{.data.KEYCLOAK_ADMIN_PASSWORD}")
+	if out, err := secCmd.Output(); err == nil {
+		parts := strings.SplitN(strings.TrimSpace(string(out)), ":", 2)
+		if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
+			uBytes, errU := base64.StdEncoding.DecodeString(parts[0])
+			pBytes, errP := base64.StdEncoding.DecodeString(parts[1])
+			if errU == nil && errP == nil {
+				u := strings.TrimSpace(string(uBytes))
+				p := strings.TrimSpace(string(pBytes))
+				if envUser != "" {
+					u = envUser
+				}
+				if envPass != "" {
+					p = envPass
+				}
+				if u != "" && p != "" {
+					return u, p
+				}
+			}
+		}
+	}
+
+	// 2. Fallback: inspect existing Deployment env vars (for backwards compatibility with older deployments)
+	depCmd := exec.CommandContext(ctx, "kubectl", "get", "deployment", "keycloak", "-n", KeycloakNamespace,
+		"-o", `jsonpath={.spec.template.spec.containers[0].env[?(@.name=="KEYCLOAK_ADMIN")].value}:{.spec.template.spec.containers[0].env[?(@.name=="KEYCLOAK_ADMIN_PASSWORD")].value}`)
+	if out, err := depCmd.Output(); err == nil {
+		parts := strings.SplitN(strings.TrimSpace(string(out)), ":", 2)
+		if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
+			return parts[0], parts[1]
+		}
+	}
+
+	return envUser, envPass
+}
 
 // VerifyDeployAuthAndGetToken verifies the user's Keycloak session in ~/.idlistack/credentials.json,
 // enforces Cluster-Wide vs Namespace-Scoped RBAC for targetNamespace, applies the K8s Role/RoleBinding,
@@ -63,7 +193,6 @@ func VerifyDeployAuthAndGetToken(ctx context.Context, targetNamespace string) (s
 	return k8sToken, creds.Username, creds.Scope, nil
 }
 
-
 // EnsureK3sContext ensures kubectl is targeting the local K3s cluster ("default" context)
 // rather than an inactive or secondary context like minikube.
 func EnsureK3sContext(ctx context.Context) {
@@ -85,7 +214,14 @@ func GetKeycloakBaseURL(ctx context.Context) string {
 	}
 	EnsureK3sContext(ctx)
 	nodeIP := ResolveClusterNodeIP(ctx)
-	return fmt.Sprintf("http://%s:%d", nodeIP, KeycloakNodePort)
+	nodePort := KeycloakNodePort
+	svcCmd := exec.CommandContext(ctx, "kubectl", "get", "svc", "keycloak", "-n", KeycloakNamespace, "-o", "jsonpath={.spec.ports[0].nodePort}")
+	if out, err := svcCmd.Output(); err == nil {
+		if p, errP := strconv.Atoi(strings.TrimSpace(string(out))); errP == nil && p > 0 {
+			nodePort = p
+		}
+	}
+	return fmt.Sprintf("http://%s:%d", nodeIP, nodePort)
 }
 
 // ResolveClusterNodeIP returns the InternalIP of the K3s node or 127.0.0.1
@@ -116,12 +252,63 @@ func IsKeycloakRunning(ctx context.Context) (bool, string) {
 	return ready != "" && ready != "0", url
 }
 
-// DeployKeycloakToK3s deploys Keycloak inside the local K3s cluster in namespace `idlistack-auth`
-// with a pre-configured `idlistack` realm, `idlistack-cli` OIDC client, groups mapper, and default RBAC users.
+// DeployKeycloakToK3s deploys Keycloak inside the local K3s cluster using default dynamic configuration.
 func DeployKeycloakToK3s(ctx context.Context) (string, error) {
+	cfg := DefaultKeycloakDeployConfig(ctx)
+	return DeployKeycloakWithConfig(ctx, cfg)
+}
+
+// DeployKeycloakWithConfig deploys Keycloak inside the local K3s cluster with the provided dynamic configuration.
+func DeployKeycloakWithConfig(ctx context.Context, cfg KeycloakDeployConfig) (string, error) {
 	EnsureK3sContext(ctx)
-	ui.Detail("Creating namespace %s in K3s...", color.CyanString(KeycloakNamespace))
-	manifest := generateKeycloakK8sManifest()
+	if cfg.Namespace == "" {
+		cfg.Namespace = KeycloakNamespace
+	}
+	if cfg.Realm == "" {
+		cfg.Realm = KeycloakRealm
+	}
+	if cfg.ClientID == "" {
+		cfg.ClientID = KeycloakClientID
+	}
+	if cfg.Image == "" {
+		cfg.Image = KeycloakImage
+	}
+	if cfg.HTTPPort <= 0 {
+		cfg.HTTPPort = KeycloakHTTPPort
+	}
+	if cfg.NodePort <= 0 {
+		cfg.NodePort = KeycloakNodePort
+	}
+	if cfg.Replicas <= 0 {
+		cfg.Replicas = 1
+	}
+	if cfg.TokenLifespan <= 0 {
+		cfg.TokenLifespan = 86400
+	}
+	if cfg.AdminUser == "" {
+		cfg.AdminUser = "admin"
+	}
+	if cfg.AdminPassword == "" {
+		_, existingPass := GetKeycloakAdminCredentials(ctx)
+		if existingPass != "" {
+			cfg.AdminPassword = existingPass
+		} else {
+			cfg.AdminPassword = generateRandomPassword(12)
+		}
+	}
+
+	KeycloakNamespace = cfg.Namespace
+	KeycloakRealm = cfg.Realm
+	KeycloakClientID = cfg.ClientID
+	KeycloakNodePort = cfg.NodePort
+	KeycloakHTTPPort = cfg.HTTPPort
+	KeycloakImage = cfg.Image
+
+	ui.Detail("Creating namespace %s in K3s...", color.CyanString(cfg.Namespace))
+	manifest, err := generateKeycloakK8sManifest(cfg)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate Keycloak manifest: %w", err)
+	}
 
 	applyCmd := exec.CommandContext(ctx, "kubectl", "apply", "-f", "-")
 	applyCmd.Stdin = bytes.NewBufferString(manifest)
@@ -132,7 +319,7 @@ func DeployKeycloakToK3s(ctx context.Context) (string, error) {
 	}
 
 	ui.Detail("Waiting for Keycloak pod to become ready in K3s (up to 180s)...")
-	waitCmd := exec.CommandContext(ctx, "kubectl", "rollout", "status", "deployment/keycloak", "-n", KeycloakNamespace, "--timeout=180s")
+	waitCmd := exec.CommandContext(ctx, "kubectl", "rollout", "status", "deployment/keycloak", "-n", cfg.Namespace, "--timeout=180s")
 	waitCmd.Stdout = os.Stdout
 	waitCmd.Stderr = os.Stderr
 	if err := waitCmd.Run(); err != nil {
@@ -141,6 +328,37 @@ func DeployKeycloakToK3s(ctx context.Context) (string, error) {
 
 	keycloakURL := GetKeycloakBaseURL(ctx)
 	return keycloakURL, nil
+}
+
+// GetNamespaceOwner returns the username of the user who owns or deployed this namespace, or "" if not deployed/owned yet.
+func GetNamespaceOwner(ctx context.Context, namespace string) string {
+	EnsureK3sContext(ctx)
+	if namespace == "" || namespace == "*" {
+		return ""
+	}
+	// 1. Check label idlistack.io/owner on namespace
+	cmd := exec.CommandContext(ctx, "kubectl", "get", "namespace", namespace, "-o", `jsonpath={.metadata.labels['idlistack\.io/owner']}`)
+	if out, err := cmd.Output(); err == nil {
+		owner := strings.TrimSpace(string(out))
+		if owner != "" {
+			return owner
+		}
+	}
+	// 2. Check RoleBinding in that namespace
+	rbCmd := exec.CommandContext(ctx, "kubectl", "get", "rolebinding", "-n", namespace, "-l", "managed-by=idlistack",
+		"-o", `jsonpath={.items[0].subjects[?(@.kind=="ServiceAccount")].name}`)
+	if out, err := rbCmd.Output(); err == nil {
+		sa := strings.TrimSpace(string(out))
+		if strings.HasPrefix(sa, "idlistack-user-") {
+			return strings.TrimPrefix(sa, "idlistack-user-")
+		}
+	}
+	// 3. Check any deployment in that namespace
+	depCmd := exec.CommandContext(ctx, "kubectl", "get", "deployment", "-n", namespace, "-l", "managed-by=idlistack", "-o", "jsonpath={.items[0].metadata.name}")
+	if out, err := depCmd.Output(); err == nil && strings.TrimSpace(string(out)) != "" {
+		return "existing-project"
+	}
+	return ""
 }
 
 // EnsureNamespaceRBAC provisions a Kubernetes ServiceAccount, Role, and RoleBinding (or ClusterRoleBinding)
@@ -177,6 +395,10 @@ func EnsureNamespaceRBAC(ctx context.Context, username string, groups []string, 
 	// Ensure target namespace exists if specified
 	if targetNamespace != "" {
 		_ = exec.CommandContext(ctx, "kubectl", "create", "namespace", targetNamespace).Run()
+		// Label the owner of this project namespace if not already labeled
+		if existingOwner := GetNamespaceOwner(ctx, targetNamespace); existingOwner == "" || existingOwner == "existing-project" {
+			_ = exec.CommandContext(ctx, "kubectl", "label", "namespace", targetNamespace, fmt.Sprintf("idlistack.io/owner=%s", sanitizeK8sName(username)), "--overwrite").Run()
+		}
 	}
 
 	var rbacManifest strings.Builder
@@ -324,7 +546,113 @@ kube-apiserver-arg:
 	return cmd.Run()
 }
 
-func generateKeycloakK8sManifest() string {
+func buildDynamicRealmJSON(cfg KeycloakDeployConfig) (string, error) {
+	users := make([]map[string]any, 0, len(cfg.InitialUsers))
+	for _, u := range cfg.InitialUsers {
+		if strings.TrimSpace(u.Username) == "" || u.Password == "" {
+			continue
+		}
+		email := u.Email
+		if email == "" {
+			email = fmt.Sprintf("%s@%s.local", strings.ToLower(u.Username), cfg.Realm)
+		}
+		firstName := u.FirstName
+		if firstName == "" {
+			firstName = u.Username
+		}
+		lastName := u.LastName
+		if lastName == "" {
+			lastName = "User"
+		}
+		groups := u.Groups
+		if len(groups) == 0 {
+			groups = []string{"developers"}
+		}
+		users = append(users, map[string]any{
+			"username":      u.Username,
+			"enabled":       true,
+			"emailVerified": true,
+			"firstName":     firstName,
+			"lastName":      lastName,
+			"email":         email,
+			"groups":        groups,
+			"credentials": []map[string]any{
+				{
+					"type":      "password",
+					"value":     u.Password,
+					"temporary": false,
+				},
+			},
+		})
+	}
+
+	realmObj := map[string]any{
+		"realm":                 cfg.Realm,
+		"enabled":               true,
+		"registrationAllowed":   true,
+		"defaultGroups":         []string{"/developers"},
+		"displayName":           fmt.Sprintf("IdliStack K3s Auth (%s)", cfg.Realm),
+		"accessTokenLifespan":   cfg.TokenLifespan,
+		"ssoSessionIdleTimeout": cfg.TokenLifespan,
+		"ssoSessionMaxLifespan": cfg.TokenLifespan,
+		"groups": []map[string]any{
+			{
+				"name": "cluster-admins",
+				"path": "/cluster-admins",
+			},
+			{
+				"name": "developers",
+				"path": "/developers",
+			},
+		},
+		"clients": []map[string]any{
+			{
+				"clientId":                  cfg.ClientID,
+				"name":                      "IdliStack CLI & Auth Portal",
+				"enabled":                   true,
+				"publicClient":              true,
+				"directAccessGrantsEnabled": true,
+				"standardFlowEnabled":       true,
+				"implicitFlowEnabled":       true,
+				"redirectUris":              []string{"*"},
+				"webOrigins":                []string{"*"},
+				"protocol":                  "openid-connect",
+				"protocolMappers": []map[string]any{
+					{
+						"name":            "groups",
+						"protocol":        "openid-connect",
+						"protocolMapper":  "oidc-group-membership-mapper",
+						"consentRequired": false,
+						"config": map[string]string{
+							"full.path":            "false",
+							"id.token.claim":       "true",
+							"access.token.claim":   "true",
+							"claim.name":           "groups",
+							"userinfo.token.claim": "true",
+						},
+					},
+				},
+			},
+		},
+		"users": users,
+	}
+
+	raw, err := json.MarshalIndent(realmObj, "    ", "  ")
+	if err != nil {
+		return "", err
+	}
+	return "    " + string(raw), nil
+}
+
+func generateKeycloakK8sManifest(cfg KeycloakDeployConfig) (string, error) {
+	realmJSON, err := buildDynamicRealmJSON(cfg)
+	if err != nil {
+		return "", err
+	}
+
+	adminUserB64 := base64.StdEncoding.EncodeToString([]byte(cfg.AdminUser))
+	adminPassB64 := base64.StdEncoding.EncodeToString([]byte(cfg.AdminPassword))
+
 	return fmt.Sprintf(`apiVersion: v1
 kind: Namespace
 metadata:
@@ -333,93 +661,26 @@ metadata:
     managed-by: idlistack
 ---
 apiVersion: v1
+kind: Secret
+metadata:
+  name: %[2]s
+  namespace: %[1]s
+  labels:
+    app: keycloak
+    managed-by: idlistack
+type: Opaque
+data:
+  KEYCLOAK_ADMIN: %[3]s
+  KEYCLOAK_ADMIN_PASSWORD: %[4]s
+---
+apiVersion: v1
 kind: ConfigMap
 metadata:
   name: keycloak-realm-config
   namespace: %[1]s
 data:
-  idlistack-realm.json: |
-    {
-      "realm": "%[2]s",
-      "enabled": true,
-      "displayName": "IdliStack K3s Auth",
-      "accessTokenLifespan": 86400,
-      "ssoSessionIdleTimeout": 86400,
-      "ssoSessionMaxLifespan": 86400,
-      "groups": [
-        {
-          "name": "cluster-admins",
-          "path": "/cluster-admins"
-        },
-        {
-          "name": "developers",
-          "path": "/developers"
-        }
-      ],
-      "clients": [
-        {
-          "clientId": "%[3]s",
-          "name": "IdliStack CLI & Auth Portal",
-          "enabled": true,
-          "publicClient": true,
-          "directAccessGrantsEnabled": true,
-          "standardFlowEnabled": true,
-          "implicitFlowEnabled": true,
-          "redirectUris": ["*"],
-          "webOrigins": ["*"],
-          "protocol": "openid-connect",
-          "protocolMappers": [
-            {
-              "name": "groups",
-              "protocol": "openid-connect",
-              "protocolMapper": "oidc-group-membership-mapper",
-              "consentRequired": false,
-              "config": {
-                "full.path": "false",
-                "id.token.claim": "true",
-                "access.token.claim": "true",
-                "claim.name": "groups",
-                "userinfo.token.claim": "true"
-              }
-            }
-          ]
-        }
-      ],
-      "users": [
-        {
-          "username": "admin",
-          "enabled": true,
-          "emailVerified": true,
-          "firstName": "Cluster",
-          "lastName": "Admin",
-          "email": "admin@idlistack.local",
-          "groups": ["cluster-admins"],
-          "credentials": [
-            {
-              "type": "password",
-              "value": "admin123",
-              "temporary": false
-            }
-          ]
-        },
-        {
-          "username": "developer",
-          "enabled": true,
-          "emailVerified": true,
-          "firstName": "App",
-          "lastName": "Developer",
-          "email": "dev@idlistack.local",
-          "groups": ["developers"],
-          "credentials": [
-            {
-              "type": "password",
-              "value": "dev123",
-              "temporary": false
-            }
-          ]
-        }
-      ]
-    }
+  %[5]s-realm.json: |
+%[6]s
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -430,7 +691,7 @@ metadata:
     app: keycloak
     managed-by: idlistack
 spec:
-  replicas: 1
+  replicas: %[7]d
   selector:
     matchLabels:
       app: keycloak
@@ -441,25 +702,31 @@ spec:
     spec:
       containers:
       - name: keycloak
-        image: quay.io/keycloak/keycloak:24.0
+        image: %[8]s
         imagePullPolicy: IfNotPresent
         args:
         - start-dev
         - --import-realm
         env:
         - name: KEYCLOAK_ADMIN
-          value: "admin"
+          valueFrom:
+            secretKeyRef:
+              name: %[2]s
+              key: KEYCLOAK_ADMIN
         - name: KEYCLOAK_ADMIN_PASSWORD
-          value: "admin"
+          valueFrom:
+            secretKeyRef:
+              name: %[2]s
+              key: KEYCLOAK_ADMIN_PASSWORD
         - name: KC_HTTP_PORT
-          value: "8080"
+          value: "%[9]d"
         - name: KC_HEALTH_ENABLED
           value: "true"
         ports:
-        - containerPort: 8080
+        - containerPort: %[9]d
         readinessProbe:
           tcpSocket:
-            port: 8080
+            port: %[9]d
           initialDelaySeconds: 10
           periodSeconds: 5
           failureThreshold: 30
@@ -485,9 +752,9 @@ spec:
     app: keycloak
   ports:
   - protocol: TCP
-    port: 8080
-    targetPort: 8080
-    nodePort: %[4]d
+    port: %[9]d
+    targetPort: %[9]d
+    nodePort: %[10]d
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -521,7 +788,18 @@ spec:
         hostPath:
           path: /run/k3s/containerd
           type: Directory
-`, KeycloakNamespace, KeycloakRealm, KeycloakClientID, KeycloakNodePort)
+`,
+		cfg.Namespace,
+		KeycloakAdminSecret,
+		adminUserB64,
+		adminPassB64,
+		cfg.Realm,
+		realmJSON,
+		cfg.Replicas,
+		cfg.Image,
+		cfg.HTTPPort,
+		cfg.NodePort,
+	), nil
 }
 
 // EnsureContainerdSocketPermissions ensures /run/k3s/containerd/containerd.sock has 0666 permissions

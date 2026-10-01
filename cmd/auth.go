@@ -30,7 +30,15 @@ var (
 	loginNamespace   string
 	loginPort        int
 	loginStayOpen    bool
-	setupK3sOIDC     bool
+	setupK3sOIDC       bool
+	setupNamespace     string
+	setupRealm         string
+	setupClientID      string
+	setupImage         string
+	setupNodePort      int
+	setupHTTPPort      int
+	setupAdminUser     string
+	setupAdminPassword string
 
 	newUserPassword  string
 	newUserEmail     string
@@ -71,7 +79,7 @@ var authCmd = &cobra.Command{
 
 var authSetupCmd = &cobra.Command{
 	Use:   "setup",
-	Short: "Deploy Keycloak inside local K3s (idlistack-auth) with pre-configured realm & RBAC",
+	Short: "Deploy Keycloak inside local K3s with dynamic realm & RBAC configuration",
 	RunE:  runAuthSetup,
 }
 
@@ -94,7 +102,7 @@ realm (idlistack) and automatically provisions their K3s RBAC bindings:
 
 func init() {
 	loginCmd.Flags().BoolVar(&loginCliOnly, "cli", false, "Authenticate via terminal prompt instead of browser frontend")
-	loginCmd.Flags().StringVarP(&loginUsername, "username", "u", "", "Keycloak username (e.g. admin or developer)")
+	loginCmd.Flags().StringVarP(&loginUsername, "username", "u", "", "Keycloak username")
 	loginCmd.Flags().StringVarP(&loginPassword, "password", "p", "", "Keycloak password")
 	loginCmd.Flags().StringVar(&loginKeycloakURL, "keycloak-url", "", "Keycloak base URL (auto-detected from K3s if empty)")
 	loginCmd.Flags().StringVarP(&loginNamespace, "namespace", "n", "", "Target namespace scope for namespace-wise RBAC (e.g. idlistack-myapp)")
@@ -104,6 +112,14 @@ func init() {
 	authPortalCmd.Flags().IntVar(&loginPort, "port", 4201, "Port for the local authentication web frontend")
 
 	authSetupCmd.Flags().BoolVar(&setupK3sOIDC, "configure-k3s-oidc", false, "Also write OIDC issuer flags to /etc/rancher/k3s/config.yaml and restart K3s")
+	authSetupCmd.Flags().StringVar(&setupNamespace, "namespace", "", "K3s namespace for Keycloak (default: idlistack-auth or $IDLISTACK_KEYCLOAK_NAMESPACE)")
+	authSetupCmd.Flags().StringVar(&setupRealm, "realm", "", "Keycloak realm name (default: idlistack or $IDLISTACK_KEYCLOAK_REALM)")
+	authSetupCmd.Flags().StringVar(&setupClientID, "client-id", "", "Keycloak OIDC client ID (default: idlistack-cli or $IDLISTACK_KEYCLOAK_CLIENT_ID)")
+	authSetupCmd.Flags().StringVar(&setupImage, "image", "", "Keycloak container image (default: quay.io/keycloak/keycloak:24.0 or $IDLISTACK_KEYCLOAK_IMAGE)")
+	authSetupCmd.Flags().IntVar(&setupNodePort, "node-port", 0, "Keycloak Service NodePort (default: 30080 or $IDLISTACK_KEYCLOAK_NODEPORT)")
+	authSetupCmd.Flags().IntVar(&setupHTTPPort, "http-port", 0, "Keycloak container HTTP port (default: 8080 or $IDLISTACK_KEYCLOAK_HTTP_PORT)")
+	authSetupCmd.Flags().StringVar(&setupAdminUser, "admin-user", "", "Keycloak master admin username (stored in K8s Secret)")
+	authSetupCmd.Flags().StringVar(&setupAdminPassword, "admin-password", "", "Keycloak master admin password (auto-generated in K8s Secret if omitted)")
 
 	authCreateUserCmd.Flags().StringVarP(&newUserPassword, "password", "p", "", "Password for the new user (required)")
 	authCreateUserCmd.Flags().StringVarP(&newUserEmail, "email", "e", "", "Email address for the new user")
@@ -168,10 +184,36 @@ func runAuthCreateUser(cmd *cobra.Command, args []string) error {
 
 func runAuthSetup(cmd *cobra.Command, args []string) error {
 	ctx := cmd.Context()
-	ui.PrintBanner()
-	ui.Step(1, 2, "Deploying Keycloak inside K3s cluster (namespace: idlistack-auth)")
+	cfg := k8s.DefaultKeycloakDeployConfig(ctx)
+	if setupNamespace != "" {
+		cfg.Namespace = setupNamespace
+	}
+	if setupRealm != "" {
+		cfg.Realm = setupRealm
+	}
+	if setupClientID != "" {
+		cfg.ClientID = setupClientID
+	}
+	if setupImage != "" {
+		cfg.Image = setupImage
+	}
+	if setupNodePort > 0 {
+		cfg.NodePort = setupNodePort
+	}
+	if setupHTTPPort > 0 {
+		cfg.HTTPPort = setupHTTPPort
+	}
+	if setupAdminUser != "" {
+		cfg.AdminUser = setupAdminUser
+	}
+	if setupAdminPassword != "" {
+		cfg.AdminPassword = setupAdminPassword
+	}
 
-	kcURL, err := k8s.DeployKeycloakToK3s(ctx)
+	ui.PrintBanner()
+	ui.Step(1, 2, fmt.Sprintf("Deploying Keycloak inside K3s cluster (namespace: %s)", cfg.Namespace))
+
+	kcURL, err := k8s.DeployKeycloakWithConfig(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -189,12 +231,14 @@ func runAuthSetup(cmd *cobra.Command, args []string) error {
 
 	fmt.Println()
 	ui.Success(fmt.Sprintf("Keycloak is running in K3s at %s", color.CyanString(kcURL)))
-	ui.Detail("Realm:              %s", color.CyanString(k8s.KeycloakRealm))
-	ui.Detail("OIDC Client ID:     %s", color.CyanString(k8s.KeycloakClientID))
-	ui.Detail("Cluster Admin User: %s (password: %s) -> Cluster-Wide RBAC", color.GreenString("admin"), "admin123")
-	ui.Detail("Namespace Dev User: %s (password: %s) -> Namespace-Scoped RBAC", color.CyanString("developer"), "dev123")
+	ui.Detail("Namespace:          %s", color.CyanString(cfg.Namespace))
+	ui.Detail("Realm:              %s", color.CyanString(cfg.Realm))
+	ui.Detail("OIDC Client ID:     %s", color.CyanString(cfg.ClientID))
+	ui.Detail("Admin Secret:       %s (in namespace %s)", color.CyanString(k8s.KeycloakAdminSecret), cfg.Namespace)
 	fmt.Println()
-	ui.Info(fmt.Sprintf("Next: run %s to authenticate", color.CyanString("idlistack login")))
+	ui.Info(fmt.Sprintf("Next: run %s (or %s) to dynamically create a user and authenticate",
+		color.CyanString("idlistack login"),
+		color.CyanString("idlistack auth create-user <username> --role admin|developer")))
 	return nil
 }
 
@@ -357,6 +401,11 @@ func runWhoami(cmd *cobra.Command, args []string) error {
 	creds, err := auth.LoadCredentials()
 	if err != nil {
 		ui.Warn("Not logged in. Run 'idlistack login' to authenticate with Keycloak.")
+		return nil
+	}
+
+	if valErr := auth.ValidateKeycloakSession(cmd.Context(), creds); valErr != nil {
+		ui.Warn(fmt.Sprintf("Session Invalid: %v", valErr))
 		return nil
 	}
 
