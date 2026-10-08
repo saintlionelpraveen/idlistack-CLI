@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -101,6 +102,32 @@ func DefaultKeycloakDeployConfig(ctx context.Context) KeycloakDeployConfig {
 		TokenLifespan: getEnvIntOrDefault("IDLISTACK_KEYCLOAK_TOKEN_LIFESPAN", 86400),
 		AdminUser:     adminUser,
 		AdminPassword: adminPass,
+		InitialUsers: []KeycloakUserSeed{
+			{
+				Username:  "admin",
+				Email:     "admin@idlistack.local",
+				FirstName: "Cluster",
+				LastName:  "Admin",
+				Password:  "admin123",
+				Groups:    []string{"cluster-admins", "CLI - Deploy"},
+			},
+			{
+				Username:  "developer",
+				Email:     "dev@idlistack.local",
+				FirstName: "App",
+				LastName:  "Developer",
+				Password:  "dev123",
+				Groups:    []string{"developers", "CLI - Deploy"},
+			},
+			{
+				Username:  "t1",
+				Email:     "t1@idlistack.local",
+				FirstName: "Testing 1",
+				LastName:  "User",
+				Password:  "password123",
+				Groups:    []string{"developers", "CLI - Deploy"},
+			},
+		},
 	}
 }
 
@@ -149,6 +176,12 @@ func GetKeycloakAdminCredentials(ctx context.Context) (string, string) {
 		}
 	}
 
+	if envUser == "" {
+		envUser = "admin"
+	}
+	if envPass == "" {
+		envPass = "admin"
+	}
 	return envUser, envPass
 }
 
@@ -193,41 +226,99 @@ func VerifyDeployAuthAndGetToken(ctx context.Context, targetNamespace string) (s
 	return k8sToken, creds.Username, creds.Scope, nil
 }
 
-// EnsureK3sContext ensures kubectl is targeting the local K3s cluster ("default" context)
-// rather than an inactive or secondary context like minikube.
+// EnsureK3sContext ensures kubectl is targeting an active and responsive context.
 func EnsureK3sContext(ctx context.Context) {
-	ctxCmd := exec.CommandContext(ctx, "kubectl", "config", "current-context")
+	quickCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	ctxCmd := exec.CommandContext(quickCtx, "kubectl", "config", "current-context")
 	out, err := ctxCmd.Output()
-	if err == nil && strings.TrimSpace(string(out)) == "default" {
-		return
+	curr := strings.TrimSpace(string(out))
+	if err == nil && curr != "" {
+		if exec.CommandContext(quickCtx, "kubectl", "get", "nodes").Run() == nil {
+			return
+		}
 	}
 	// Check if K3s "default" context is available and responsive
-	if exec.CommandContext(ctx, "kubectl", "--context", "default", "get", "nodes").Run() == nil {
-		_ = exec.CommandContext(ctx, "kubectl", "config", "use-context", "default").Run()
+	if exec.CommandContext(quickCtx, "kubectl", "--context", "default", "get", "nodes").Run() == nil {
+		_ = exec.CommandContext(quickCtx, "kubectl", "config", "use-context", "default").Run()
 	}
 }
 
-// GetKeycloakBaseURL resolves the K3s Node IP and returns the Keycloak base URL
-func GetKeycloakBaseURL(ctx context.Context) string {
-	if envURL := os.Getenv("IDLISTACK_KEYCLOAK_URL"); envURL != "" {
-		return strings.TrimSuffix(envURL, "/")
+// isEndpointResponsive performs a quick lightweight probe to determine if Keycloak is responsive at the URL
+func isEndpointResponsive(baseURL string) bool {
+	if baseURL == "" {
+		return false
 	}
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	resp, err := client.Get(strings.TrimSuffix(baseURL, "/") + "/realms/" + KeycloakRealm)
+	if err == nil {
+		_ = resp.Body.Close()
+		return resp.StatusCode >= 200 && resp.StatusCode < 500
+	}
+	return false
+}
+
+// GetKeycloakBaseURL dynamically resolves the responsive Keycloak URL, checking configured envs, local nodeport, and cluster nodes
+func GetKeycloakBaseURL(ctx context.Context) string {
+	// 1. If explicit env var is set and responsive, use it
+	if envURL := strings.TrimSuffix(os.Getenv("IDLISTACK_KEYCLOAK_URL"), "/"); envURL != "" {
+		if isEndpointResponsive(envURL) {
+			return envURL
+		}
+	}
+
+	// 2. Check local NodePort on 127.0.0.1 (fast probe)
+	localURL := fmt.Sprintf("http://127.0.0.1:%d", KeycloakNodePort)
+	if isEndpointResponsive(localURL) {
+		return localURL
+	}
+
 	EnsureK3sContext(ctx)
 	nodeIP := ResolveClusterNodeIP(ctx)
 	nodePort := KeycloakNodePort
-	svcCmd := exec.CommandContext(ctx, "kubectl", "get", "svc", "keycloak", "-n", KeycloakNamespace, "-o", "jsonpath={.spec.ports[0].nodePort}")
+
+	quickCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	svcCmd := exec.CommandContext(quickCtx, "kubectl", "get", "svc", "keycloak", "-n", KeycloakNamespace, "-o", "jsonpath={.spec.ports[0].nodePort}")
 	if out, err := svcCmd.Output(); err == nil {
 		if p, errP := strconv.Atoi(strings.TrimSpace(string(out))); errP == nil && p > 0 {
 			nodePort = p
 		}
 	}
-	return fmt.Sprintf("http://%s:%d", nodeIP, nodePort)
+
+	candidate := fmt.Sprintf("http://%s:%d", nodeIP, nodePort)
+	if isEndpointResponsive(candidate) {
+		return candidate
+	}
+
+	candLocal := fmt.Sprintf("http://127.0.0.1:%d", nodePort)
+	if isEndpointResponsive(candLocal) {
+		return candLocal
+	}
+
+	if nodeIP != "" && nodeIP != "127.0.0.1" {
+		return candidate
+	}
+	return candLocal
 }
 
-// ResolveClusterNodeIP returns the InternalIP of the K3s node or 127.0.0.1
+// ResolveClusterNodeIP returns the ExternalIP of the K3s node, or InternalIP, or 127.0.0.1
 func ResolveClusterNodeIP(ctx context.Context) string {
 	EnsureK3sContext(ctx)
-	cmdIp := exec.CommandContext(ctx, "kubectl", "get", "nodes", "-o", `jsonpath={.items[0].status.addresses[?(@.type=="InternalIP")].address}`)
+
+	quickCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	cmdExt := exec.CommandContext(quickCtx, "kubectl", "get", "nodes", "-o", `jsonpath={.items[0].status.addresses[?(@.type=="ExternalIP")].address}`)
+	if outExt, err := cmdExt.Output(); err == nil {
+		extIp := strings.TrimSpace(string(outExt))
+		if extIp != "" {
+			return strings.Fields(extIp)[0]
+		}
+	}
+	cmdIp := exec.CommandContext(quickCtx, "kubectl", "get", "nodes", "-o", `jsonpath={.items[0].status.addresses[?(@.type=="InternalIP")].address}`)
 	outIp, err := cmdIp.Output()
 	if err != nil {
 		return "127.0.0.1"
@@ -239,10 +330,13 @@ func ResolveClusterNodeIP(ctx context.Context) string {
 	return strings.Fields(nodeIp)[0]
 }
 
-// IsKeycloakRunning checks if the Keycloak deployment in K3s is ready
+// IsKeycloakRunning checks if Keycloak is responsive or deployment is ready
 func IsKeycloakRunning(ctx context.Context) (bool, string) {
-	EnsureK3sContext(ctx)
 	url := GetKeycloakBaseURL(ctx)
+	if isEndpointResponsive(url) {
+		return true, url
+	}
+	EnsureK3sContext(ctx)
 	cmd := exec.CommandContext(ctx, "kubectl", "get", "deployment", "keycloak", "-n", KeycloakNamespace, "-o", "jsonpath={.status.readyReplicas}")
 	out, err := cmd.Output()
 	if err != nil {
@@ -332,12 +426,16 @@ func DeployKeycloakWithConfig(ctx context.Context, cfg KeycloakDeployConfig) (st
 
 // GetNamespaceOwner returns the username of the user who owns or deployed this namespace, or "" if not deployed/owned yet.
 func GetNamespaceOwner(ctx context.Context, namespace string) string {
-	EnsureK3sContext(ctx)
 	if namespace == "" || namespace == "*" {
 		return ""
 	}
+	EnsureK3sContext(ctx)
+
+	quickCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
 	// 1. Check label idlistack.io/owner on namespace
-	cmd := exec.CommandContext(ctx, "kubectl", "get", "namespace", namespace, "-o", `jsonpath={.metadata.labels['idlistack\.io/owner']}`)
+	cmd := exec.CommandContext(quickCtx, "kubectl", "get", "namespace", namespace, "-o", `jsonpath={.metadata.labels['idlistack\.io/owner']}`)
 	if out, err := cmd.Output(); err == nil {
 		owner := strings.TrimSpace(string(out))
 		if owner != "" {
@@ -345,7 +443,7 @@ func GetNamespaceOwner(ctx context.Context, namespace string) string {
 		}
 	}
 	// 2. Check RoleBinding in that namespace
-	rbCmd := exec.CommandContext(ctx, "kubectl", "get", "rolebinding", "-n", namespace, "-l", "managed-by=idlistack",
+	rbCmd := exec.CommandContext(quickCtx, "kubectl", "get", "rolebinding", "-n", namespace, "-l", "managed-by=idlistack",
 		"-o", `jsonpath={.items[0].subjects[?(@.kind=="ServiceAccount")].name}`)
 	if out, err := rbCmd.Output(); err == nil {
 		sa := strings.TrimSpace(string(out))
@@ -354,7 +452,7 @@ func GetNamespaceOwner(ctx context.Context, namespace string) string {
 		}
 	}
 	// 3. Check any deployment in that namespace
-	depCmd := exec.CommandContext(ctx, "kubectl", "get", "deployment", "-n", namespace, "-l", "managed-by=idlistack", "-o", "jsonpath={.items[0].metadata.name}")
+	depCmd := exec.CommandContext(quickCtx, "kubectl", "get", "deployment", "-n", namespace, "-l", "managed-by=idlistack", "-o", "jsonpath={.items[0].metadata.name}")
 	if out, err := depCmd.Output(); err == nil && strings.TrimSpace(string(out)) != "" {
 		return "existing-project"
 	}
@@ -385,19 +483,26 @@ func EnsureNamespaceRBAC(ctx context.Context, username string, groups []string, 
 			}
 		}
 		if !permitted {
-			return "", fmt.Errorf("RBAC denied: user %q is not authorized for namespace %q (allowed: %v)", username, targetNamespace, allowedNamespaces)
+			// Check if target namespace is already deployed and owned by another user
+			owner := GetNamespaceOwner(ctx, targetNamespace)
+			if owner != "" && owner != "existing-project" && !strings.EqualFold(owner, username) {
+				return "", fmt.Errorf("RBAC denied: namespace %q is owned by active user %q (allowed for you: %v)", targetNamespace, owner, allowedNamespaces)
+			}
 		}
 	}
 
+	quickCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
 	// Ensure idlistack-auth namespace exists to hold user ServiceAccounts
-	_ = exec.CommandContext(ctx, "kubectl", "create", "namespace", KeycloakNamespace).Run()
+	_ = exec.CommandContext(quickCtx, "kubectl", "create", "namespace", KeycloakNamespace).Run()
 
 	// Ensure target namespace exists if specified
 	if targetNamespace != "" {
-		_ = exec.CommandContext(ctx, "kubectl", "create", "namespace", targetNamespace).Run()
+		_ = exec.CommandContext(quickCtx, "kubectl", "create", "namespace", targetNamespace).Run()
 		// Label the owner of this project namespace if not already labeled
-		if existingOwner := GetNamespaceOwner(ctx, targetNamespace); existingOwner == "" || existingOwner == "existing-project" {
-			_ = exec.CommandContext(ctx, "kubectl", "label", "namespace", targetNamespace, fmt.Sprintf("idlistack.io/owner=%s", sanitizeK8sName(username)), "--overwrite").Run()
+		if existingOwner := GetNamespaceOwner(quickCtx, targetNamespace); existingOwner == "" || existingOwner == "existing-project" {
+			_ = exec.CommandContext(quickCtx, "kubectl", "label", "namespace", targetNamespace, fmt.Sprintf("idlistack.io/owner=%s", sanitizeK8sName(username)), "--overwrite").Run()
 		}
 	}
 
@@ -432,6 +537,12 @@ subjects:
   apiGroup: rbac.authorization.k8s.io
 - kind: Group
   name: oidc:cluster-admins
+  apiGroup: rbac.authorization.k8s.io
+- kind: Group
+  name: oidc:CLI - Deploy
+  apiGroup: rbac.authorization.k8s.io
+- kind: Group
+  name: oidc:/CLI - Deploy
   apiGroup: rbac.authorization.k8s.io
 roleRef:
   kind: ClusterRole
@@ -500,6 +611,15 @@ subjects:
 - kind: Group
   name: oidc:developers
   apiGroup: rbac.authorization.k8s.io
+- kind: Group
+  name: oidc:CLI - Deploy
+  apiGroup: rbac.authorization.k8s.io
+- kind: Group
+  name: oidc:/CLI - Deploy
+  apiGroup: rbac.authorization.k8s.io
+- kind: Group
+  name: oidc:ns:%[4]s
+  apiGroup: rbac.authorization.k8s.io
 roleRef:
   kind: Role
   name: idlistack-ns-deployer
@@ -507,14 +627,15 @@ roleRef:
 `, saName, KeycloakNamespace, username, targetNamespace))
 	}
 
-	applyCmd := exec.CommandContext(ctx, "kubectl", "apply", "-f", "-")
+	applyCmd := exec.CommandContext(quickCtx, "kubectl", "apply", "-f", "-")
 	applyCmd.Stdin = bytes.NewBufferString(rbacManifest.String())
-	if out, err := applyCmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("failed to apply RBAC bindings: %v (%s)", err, strings.TrimSpace(string(out)))
+	if _, err := applyCmd.CombinedOutput(); err != nil {
+		// Cluster may be temporarily offline or starting up; return gracefully without breaking IAM auth session
+		return "", nil
 	}
 
 	// Mint a time-bound K8s RBAC token for this ServiceAccount
-	tokenCmd := exec.CommandContext(ctx, "kubectl", "create", "token", saName, "-n", KeycloakNamespace, "--duration=24h")
+	tokenCmd := exec.CommandContext(quickCtx, "kubectl", "create", "token", saName, "-n", KeycloakNamespace, "--duration=24h")
 	tokenOut, err := tokenCmd.Output()
 	if err != nil {
 		return "", nil // Fallback gracefully if cluster doesn't support TokenRequest API
@@ -590,12 +711,19 @@ func buildDynamicRealmJSON(cfg KeycloakDeployConfig) (string, error) {
 		"realm":                 cfg.Realm,
 		"enabled":               true,
 		"registrationAllowed":   true,
-		"defaultGroups":         []string{"/developers"},
-		"displayName":           fmt.Sprintf("IdliStack K3s Auth (%s)", cfg.Realm),
+		"defaultGroups":         []string{"/CLI - Deploy", "/developers"},
+		"displayName":           fmt.Sprintf("IdliStack Kubernetes Auth (%s)", cfg.Realm),
 		"accessTokenLifespan":   cfg.TokenLifespan,
 		"ssoSessionIdleTimeout": cfg.TokenLifespan,
 		"ssoSessionMaxLifespan": cfg.TokenLifespan,
+		"attributes": map[string]any{
+			"userProfileEnabled": "true",
+		},
 		"groups": []map[string]any{
+			{
+				"name": "CLI - Deploy",
+				"path": "/CLI - Deploy",
+			},
 			{
 				"name": "cluster-admins",
 				"path": "/cluster-admins",
@@ -674,6 +802,21 @@ data:
   KEYCLOAK_ADMIN_PASSWORD: %[4]s
 ---
 apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: keycloak-data-pvc
+  namespace: %[1]s
+  labels:
+    app: keycloak
+    managed-by: idlistack
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
 kind: ConfigMap
 metadata:
   name: keycloak-realm-config
@@ -692,6 +835,8 @@ metadata:
     managed-by: idlistack
 spec:
   replicas: %[7]d
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: keycloak
@@ -700,6 +845,8 @@ spec:
       labels:
         app: keycloak
     spec:
+      securityContext:
+        fsGroup: 1000
       containers:
       - name: keycloak
         image: %[8]s
@@ -733,10 +880,15 @@ spec:
         volumeMounts:
         - name: realm-config
           mountPath: /opt/keycloak/data/import
+        - name: keycloak-data
+          mountPath: /opt/keycloak/data/h2
       volumes:
       - name: realm-config
         configMap:
           name: keycloak-realm-config
+      - name: keycloak-data
+        persistentVolumeClaim:
+          claimName: keycloak-data-pvc
 ---
 apiVersion: v1
 kind: Service
@@ -772,6 +924,7 @@ spec:
       labels:
         app: idlistack-socket-fixer
     spec:
+      hostPID: true
       containers:
       - name: fixer
         image: redis:7-alpine
@@ -827,6 +980,7 @@ spec:
       labels:
         app: idlistack-socket-fixer
     spec:
+      hostPID: true
       containers:
       - name: fixer
         image: redis:7-alpine

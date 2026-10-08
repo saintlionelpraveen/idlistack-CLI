@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -171,4 +172,81 @@ buildplan.json
 	ui.Info(fmt.Sprintf("Next: run %s to detect, build, and deploy", color.CyanString("idlistack up")))
 
 	return nil
+}
+
+// EnsureProjectInitialized checks if idlistack.toml exists. If missing, it auto-initializes the project.
+func EnsureProjectInitialized(ctx context.Context, cwd string) (*config.Config, error) {
+	configPath := filepath.Join(cwd, "idlistack.toml")
+	if _, err := os.Stat(configPath); err == nil {
+		return config.Load(cwd)
+	}
+
+	projectName := filepath.Base(cwd)
+	ui.Info(fmt.Sprintf("Auto-initializing project %s (zero configuration)...", color.CyanString(projectName)))
+
+	idlistackDir := filepath.Join(cwd, ".idlistack")
+	if err := os.MkdirAll(idlistackDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create .idlistack directory: %w", err)
+	}
+
+	linkData := config.LinkConfig{
+		ProjectName: projectName,
+		ProjectDir:  cwd,
+	}
+	linkBytes, _ := json.MarshalIndent(linkData, "", "  ")
+	_ = os.WriteFile(filepath.Join(idlistackDir, "link.json"), linkBytes, 0600)
+
+	plan, _ := detect.Detect(ctx, cwd, nil, false)
+
+	var buildSection, deploySection string
+	if plan != nil {
+		buildSection = fmt.Sprintf("[build]\nprovider = %q", plan.Provider)
+		if plan.Runtime != "" {
+			buildSection += fmt.Sprintf("\nruntime = %q", plan.Runtime)
+		}
+		if plan.PreInstallCmd != "" && len(plan.PreInstallCmd) < 80 {
+			buildSection += fmt.Sprintf("\npre_install_cmd = %q", plan.PreInstallCmd)
+		}
+		if plan.InstallCmd != "" && len(plan.InstallCmd) < 80 {
+			buildSection += fmt.Sprintf("\ninstall_cmd = %q", plan.InstallCmd)
+		}
+		if plan.BuildCmd != "" {
+			buildSection += fmt.Sprintf("\nbuild_cmd = %q", plan.BuildCmd)
+		}
+		if plan.StartCmd != "" && !strings.HasPrefix(plan.StartCmd, "/") {
+			buildSection += fmt.Sprintf("\nstart_cmd = %q", plan.StartCmd)
+		}
+
+		deploySection = "[deploy]\n"
+		if plan.Port > 0 {
+			deploySection += fmt.Sprintf("port = %d\n", plan.Port)
+		} else {
+			deploySection += "# port = 0\n"
+		}
+		deploySection += "replicas = 1\nhealth_check_path = \"/health\""
+	} else {
+		buildSection = "# [build]\n# provider = \"\""
+		deploySection = "# [deploy]\n# port = 0\nreplicas = 1"
+	}
+
+	tomlContent := fmt.Sprintf(`# IdliStack Configuration
+# Documentation: https://idlistack.com/docs/config
+
+[project]
+name = %q
+
+%s
+
+%s
+`, projectName, buildSection, deploySection)
+
+	if err := os.WriteFile(configPath, []byte(tomlContent), 0644); err != nil {
+		return nil, fmt.Errorf("failed to write idlistack.toml: %w", err)
+	}
+
+	gitignoreContent := "# IdliStack internal state\nlink.json\nbuildplan.json\n*.lock\n"
+	_ = os.WriteFile(filepath.Join(idlistackDir, ".gitignore"), []byte(gitignoreContent), 0644)
+
+	ui.Success(fmt.Sprintf("✓ Initialized %s configuration", color.CyanString("idlistack.toml")))
+	return config.Load(cwd)
 }

@@ -198,16 +198,31 @@ func BuildAndSaveCredentialsFromTokens(ctx context.Context, keycloakURL, realm, 
 	scope := "namespace-scoped"
 	var tokenNamespaces []string
 	for _, g := range groups {
-		gClean := strings.ToLower(strings.TrimPrefix(g, "/"))
-		if gClean == "cluster-admins" || gClean == "admin" || gClean == "admins" {
+		raw := strings.Trim(g, "/")
+		parts := strings.Split(raw, "/")
+		leaf := strings.ToLower(parts[len(parts)-1])
+
+		if leaf == "cluster-admins" || leaf == "admin" || leaf == "admins" {
 			scope = "cluster-wide"
 		}
-		if strings.HasPrefix(gClean, "ns:") {
-			ns := strings.TrimPrefix(gClean, "ns:")
+		if strings.HasPrefix(leaf, "ns:") {
+			ns := strings.TrimPrefix(leaf, "ns:")
 			if !strings.HasPrefix(ns, "idlistack-") && ns != "*" {
 				ns = "idlistack-" + ns
 			}
 			tokenNamespaces = appendUnique(tokenNamespaces, ns)
+		} else {
+			// Also inspect each segment in case ns: is in path
+			for _, part := range parts {
+				pLower := strings.ToLower(part)
+				if strings.HasPrefix(pLower, "ns:") {
+					ns := strings.TrimPrefix(pLower, "ns:")
+					if !strings.HasPrefix(ns, "idlistack-") && ns != "*" {
+						ns = "idlistack-" + ns
+					}
+					tokenNamespaces = appendUnique(tokenNamespaces, ns)
+				}
+			}
 		}
 	}
 
@@ -259,8 +274,11 @@ func BuildAndSaveCredentialsFromTokens(ctx context.Context, keycloakURL, realm, 
 	return creds, nil
 }
 
-// RefreshSession refreshes an expired token using the Keycloak refresh_token
+// RefreshSession refreshes an expired token using Keycloak refresh_token
 func RefreshSession(ctx context.Context, creds *Credentials) (*Credentials, error) {
+	if creds == nil {
+		return nil, fmt.Errorf("session expired; please run 'idlistack login'")
+	}
 	if creds.RefreshToken == "" || creds.KeycloakURL == "" {
 		return nil, fmt.Errorf("session expired; please run 'idlistack login'")
 	}
@@ -300,7 +318,11 @@ func RefreshSession(ctx context.Context, creds *Credentials) (*Credentials, erro
 // If the user was deleted, disabled, or session revoked in Keycloak, it clears the local credentials
 // and returns an error forcing re-authentication.
 func ValidateKeycloakSession(ctx context.Context, creds *Credentials) error {
-	if creds == nil || creds.AccessToken == "" || creds.KeycloakURL == "" {
+	if creds == nil || creds.AccessToken == "" {
+		return fmt.Errorf("no active session")
+	}
+
+	if creds.KeycloakURL == "" {
 		return fmt.Errorf("no active session")
 	}
 
@@ -405,13 +427,16 @@ func VerifyAndAuthorize(ctx context.Context, targetNamespace string) (*Credentia
 	// Ensure RBAC bindings exist for targetNamespace and verify namespace permission
 	if targetNamespace != "" {
 		k8sToken, rbacErr := k8s.EnsureNamespaceRBAC(ctx, creds.Username, creds.Groups, creds.AllowedNamespaces, targetNamespace)
-		if rbacErr != nil {
+		if rbacErr != nil && strings.Contains(rbacErr.Error(), "RBAC denied") {
 			return nil, rbacErr
 		}
-		if k8sToken != "" && k8sToken != creds.K8sToken {
-			creds.K8sToken = k8sToken
-			_ = SaveCredentials(creds)
+		if creds.Scope != "cluster-wide" {
+			creds.AllowedNamespaces = appendUnique(creds.AllowedNamespaces, targetNamespace)
 		}
+		if k8sToken != "" {
+			creds.K8sToken = k8sToken
+		}
+		_ = SaveCredentials(creds)
 	}
 
 	return creds, nil
@@ -484,17 +509,86 @@ func appendUnique(slice []string, item string) []string {
 	return append(slice, item)
 }
 
+// KeycloakParentGroup defines the container group in Keycloak
+const KeycloakParentGroup = "CLI - Deploy"
+
+func ensureKeycloakUserProfileAllowsMinLength(ctx context.Context, client *http.Client, kcURL, adminToken string, minLength int) {
+	upURL := fmt.Sprintf("%s/admin/realms/%s/users/profile", kcURL, k8s.KeycloakRealm)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, upURL, nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	var profile map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&profile); err != nil {
+		return
+	}
+	attrs, ok := profile["attributes"].([]any)
+	if !ok {
+		return
+	}
+	modified := false
+	for _, a := range attrs {
+		attrMap, ok := a.(map[string]any)
+		if !ok {
+			continue
+		}
+		if name, _ := attrMap["name"].(string); name == "username" {
+			val, _ := attrMap["validations"].(map[string]any)
+			if val != nil {
+				lenVal, _ := val["length"].(map[string]any)
+				if lenVal != nil {
+					if currentMin, ok := lenVal["min"].(float64); ok && currentMin > float64(minLength) {
+						lenVal["min"] = minLength
+						modified = true
+					}
+				}
+			}
+		}
+		if name, _ := attrMap["name"].(string); name == "lastName" || name == "firstName" {
+			if _, hasReq := attrMap["required"]; hasReq {
+				delete(attrMap, "required")
+				modified = true
+			}
+		}
+	}
+	if modified {
+		data, _ := json.Marshal(profile)
+		putReq, _ := http.NewRequestWithContext(ctx, http.MethodPut, upURL, bytes.NewBuffer(data))
+		if putReq != nil {
+			putReq.Header.Set("Authorization", "Bearer "+adminToken)
+			putReq.Header.Set("Content-Type", "application/json")
+			if pResp, err := client.Do(putReq); err == nil {
+				pResp.Body.Close()
+			}
+		}
+	}
+}
+
 // CreateKeycloakUser dynamically creates a new user in Keycloak (`idlistack` realm),
-// assigns them to the requested group (`cluster-admins` or `developers` + `ns:<namespace>`),
+// assigns them under the `CLI - Deploy` group and their role/namespace groups,
 // and provisions their K3s RBAC bindings automatically.
-func CreateKeycloakUser(ctx context.Context, username, email, password, role, targetNamespace string) error {
+func CreateKeycloakUser(ctx context.Context, username, email, firstName, lastName, password, role, targetNamespace string) error {
 	username = strings.TrimSpace(username)
 	email = strings.TrimSpace(email)
+	firstName = strings.TrimSpace(firstName)
+	lastName = strings.TrimSpace(lastName)
 	if username == "" || password == "" {
 		return fmt.Errorf("username and password are required")
 	}
 	if email == "" {
 		email = fmt.Sprintf("%s@%s.local", strings.ToLower(username), k8s.KeycloakRealm)
+	}
+	if firstName == "" {
+		firstName = username
+	}
+	if lastName == "" {
+		lastName = "User"
 	}
 
 	kcURL := k8s.GetKeycloakBaseURL(ctx)
@@ -532,37 +626,52 @@ func CreateKeycloakUser(ctx context.Context, username, email, password, role, ta
 		return fmt.Errorf("failed to authenticate with Keycloak Admin API (HTTP %d)", resp.StatusCode)
 	}
 
-	// 2. Ensure self-registration is enabled on the idlistack realm
-	enableRealmSelfRegistration(ctx, client, kcURL, adminTok.AccessToken)
+	// 2. Ensure Keycloak user profile allows usernames of length >= 2
+	ensureKeycloakUserProfileAllowsMinLength(ctx, client, kcURL, adminTok.AccessToken, 2)
 
-	// 3. Determine dynamic groups based on role and targetNamespace
+	// 3. Ensure group 'CLI - Deploy' exists in Keycloak
+	ensureKeycloakGroupExists(ctx, client, kcURL, adminTok.AccessToken, KeycloakParentGroup)
+	parentGroupID := findKeycloakGroupID(ctx, client, kcURL, adminTok.AccessToken, KeycloakParentGroup)
+
+	// 4. Determine dynamic groups
 	isClusterAdmin := strings.EqualFold(role, "admin") || strings.EqualFold(role, "cluster-wide") || strings.EqualFold(role, "cluster-admin")
-	groups := []string{"developers"}
+	roleGroup := "developers"
 	var allowedNS []string
 
 	if isClusterAdmin {
-		groups = []string{"cluster-admins"}
+		roleGroup = "cluster-admins"
 		allowedNS = []string{"*"}
 	} else if targetNamespace != "" && targetNamespace != "*" {
 		if !strings.HasPrefix(targetNamespace, "idlistack-") {
 			targetNamespace = "idlistack-" + strings.ToLower(targetNamespace)
 		}
-		nsGroup := "ns:" + targetNamespace
-		ensureKeycloakGroupExists(ctx, client, kcURL, adminTok.AccessToken, nsGroup)
-		groups = append(groups, nsGroup)
 		allowedNS = []string{targetNamespace}
 	}
 
-	for _, g := range groups {
-		ensureKeycloakGroupExists(ctx, client, kcURL, adminTok.AccessToken, g)
+	// Ensure role group ('developers' or 'cluster-admins') exists in Keycloak
+	ensureKeycloakGroupExists(ctx, client, kcURL, adminTok.AccessToken, roleGroup)
+	roleGroupID := findKeycloakGroupID(ctx, client, kcURL, adminTok.AccessToken, roleGroup)
+
+	// Ensure namespace group exists if scoped
+	if len(allowedNS) > 0 && allowedNS[0] != "*" {
+		ensureKeycloakGroupExists(ctx, client, kcURL, adminTok.AccessToken, "ns:"+allowedNS[0])
 	}
 
-	// 4. Create User in Keycloak `idlistack` realm
+	// 5. Ensure realm self-registration is enabled on idlistack realm with defaultGroups
+	enableRealmSelfRegistration(ctx, client, kcURL, adminTok.AccessToken)
+
+	// Dynamic groups list for RBAC evaluation
+	rbacGroups := []string{KeycloakParentGroup, username, roleGroup}
+	if len(allowedNS) > 0 && allowedNS[0] != "*" {
+		rbacGroups = append(rbacGroups, "ns:"+allowedNS[0])
+	}
+
+	// 6. Create User in Keycloak `idlistack` realm
 	userPayload := map[string]any{
 		"username":        username,
 		"email":           email,
-		"firstName":       username,
-		"lastName":        "User",
+		"firstName":       firstName,
+		"lastName":        lastName,
 		"enabled":         true,
 		"emailVerified":   true,
 		"requiredActions": []string{},
@@ -590,12 +699,16 @@ func CreateKeycloakUser(ctx context.Context, username, email, password, role, ta
 	}
 	defer createResp.Body.Close()
 
-	if createResp.StatusCode != http.StatusCreated && createResp.StatusCode != http.StatusConflict && createResp.StatusCode != http.StatusNoContent {
+	if createResp.StatusCode == http.StatusConflict {
+		return fmt.Errorf("user '%s' or email already exists in Keycloak. Please sign in.", username)
+	}
+
+	if createResp.StatusCode != http.StatusCreated && createResp.StatusCode != http.StatusNoContent {
 		body, _ := io.ReadAll(createResp.Body)
 		return fmt.Errorf("Keycloak user creation failed (HTTP %d): %s", createResp.StatusCode, string(body))
 	}
 
-	// 5. Look up user ID to ensure profile, password, and dynamic group memberships are assigned
+	// 7. Look up user ID to ensure profile, password, and group memberships are assigned
 	if userID := findKeycloakUserID(ctx, client, kcURL, adminTok.AccessToken, username); userID != "" {
 		updateReq, _ := http.NewRequestWithContext(ctx, http.MethodPut, fmt.Sprintf("%s/admin/realms/%s/users/%s", kcURL, k8s.KeycloakRealm, userID), bytes.NewBuffer(payloadBytes))
 		if updateReq != nil {
@@ -606,21 +719,33 @@ func CreateKeycloakUser(ctx context.Context, username, email, password, role, ta
 			}
 		}
 		resetKeycloakUserPassword(ctx, client, kcURL, adminTok.AccessToken, userID, password)
-		for _, g := range groups {
-			if groupID := findKeycloakGroupID(ctx, client, kcURL, adminTok.AccessToken, g); groupID != "" {
-				assignUserToKeycloakGroup(ctx, client, kcURL, adminTok.AccessToken, userID, groupID)
+
+		// Assign to group 'CLI - Deploy'
+		if parentGroupID != "" {
+			assignUserToKeycloakGroup(ctx, client, kcURL, adminTok.AccessToken, userID, parentGroupID)
+		}
+
+		// Assign to role group ('developers' or 'cluster-admins')
+		if roleGroupID != "" {
+			assignUserToKeycloakGroup(ctx, client, kcURL, adminTok.AccessToken, userID, roleGroupID)
+		}
+
+		// Assign to namespace group if scoped
+		if len(allowedNS) > 0 && allowedNS[0] != "*" {
+			if topNSID := findKeycloakGroupID(ctx, client, kcURL, adminTok.AccessToken, "ns:"+allowedNS[0]); topNSID != "" {
+				assignUserToKeycloakGroup(ctx, client, kcURL, adminTok.AccessToken, userID, topNSID)
 			}
 		}
 	}
 
-	// 6. Dynamically provision K3s RBAC bindings for the new user immediately
-	_, _ = k8s.EnsureNamespaceRBAC(ctx, username, groups, allowedNS, targetNamespace)
+	// 8. Provision K3s RBAC bindings for the new user immediately
+	_, _ = k8s.EnsureNamespaceRBAC(ctx, username, rbacGroups, allowedNS, targetNamespace)
 	return nil
 }
 
 // RegisterAndLoginKeycloakUser dynamically creates the user in Keycloak + K3s RBAC and immediately logs them in
-func RegisterAndLoginKeycloakUser(ctx context.Context, username, email, password, role, targetNamespace string) (*Credentials, error) {
-	if err := CreateKeycloakUser(ctx, username, email, password, role, targetNamespace); err != nil {
+func RegisterAndLoginKeycloakUser(ctx context.Context, username, email, firstName, lastName, password, role, targetNamespace string) (*Credentials, error) {
+	if err := CreateKeycloakUser(ctx, username, email, firstName, lastName, password, role, targetNamespace); err != nil {
 		return nil, err
 	}
 	var allowedNS []string
@@ -637,6 +762,9 @@ func RegisterAndLoginKeycloakUser(ctx context.Context, username, email, password
 }
 
 func ensureKeycloakGroupExists(ctx context.Context, client *http.Client, kcURL, adminToken, groupName string) {
+	if findKeycloakGroupID(ctx, client, kcURL, adminToken, groupName) != "" {
+		return
+	}
 	groupsURL := fmt.Sprintf("%s/admin/realms/%s/groups", kcURL, k8s.KeycloakRealm)
 	body, _ := json.Marshal(map[string]any{"name": groupName})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, groupsURL, bytes.NewBuffer(body))
@@ -648,6 +776,54 @@ func ensureKeycloakGroupExists(ctx context.Context, client *http.Client, kcURL, 
 	if resp, err := client.Do(req); err == nil {
 		resp.Body.Close()
 	}
+}
+
+func ensureKeycloakChildGroupExists(ctx context.Context, client *http.Client, kcURL, adminToken, parentGroupID, childGroupName string) {
+	if parentGroupID == "" || childGroupName == "" {
+		return
+	}
+	if id := findKeycloakChildGroupID(ctx, client, kcURL, adminToken, parentGroupID, childGroupName); id != "" {
+		return
+	}
+	cURL := fmt.Sprintf("%s/admin/realms/%s/groups/%s/children", kcURL, k8s.KeycloakRealm, parentGroupID)
+	body, _ := json.Marshal(map[string]any{"name": childGroupName})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cURL, bytes.NewBuffer(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	req.Header.Set("Content-Type", "application/json")
+	if resp, err := client.Do(req); err == nil {
+		resp.Body.Close()
+	}
+}
+
+func findKeycloakChildGroupID(ctx context.Context, client *http.Client, kcURL, adminToken, parentGroupID, childGroupName string) string {
+	if parentGroupID == "" || childGroupName == "" {
+		return ""
+	}
+	cURL := fmt.Sprintf("%s/admin/realms/%s/groups/%s/children", kcURL, k8s.KeycloakRealm, parentGroupID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cURL, nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	var children []map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&children); err == nil {
+		for _, c := range children {
+			if name, _ := c["name"].(string); strings.EqualFold(name, childGroupName) {
+				if id, ok := c["id"].(string); ok {
+					return id
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func findKeycloakUserID(ctx context.Context, client *http.Client, kcURL, adminToken, username string) string {
@@ -732,7 +908,7 @@ func enableRealmSelfRegistration(ctx context.Context, client *http.Client, kcURL
 		"realm":               k8s.KeycloakRealm,
 		"enabled":             true,
 		"registrationAllowed": true,
-		"defaultGroups":       []string{"/developers"},
+		"defaultGroups":       []string{"/" + KeycloakParentGroup, "/developers"},
 	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, realmURL, bytes.NewBuffer(body))
 	if err != nil {
@@ -744,4 +920,107 @@ func enableRealmSelfRegistration(ctx context.Context, client *http.Client, kcURL
 		resp.Body.Close()
 	}
 }
+
+// KeycloakUserInfo represents user information retrieved from Keycloak Admin API
+type KeycloakUserInfo struct {
+	ID        string   `json:"id"`
+	Username  string   `json:"username"`
+	Email     string   `json:"email"`
+	FirstName string   `json:"firstName"`
+	LastName  string   `json:"lastName"`
+	Enabled   bool     `json:"enabled"`
+	Groups    []string `json:"groups,omitempty"`
+}
+
+// ListKeycloakUsers queries the Keycloak Admin REST API for all registered users in the realm
+func ListKeycloakUsers(ctx context.Context) ([]KeycloakUserInfo, error) {
+	kcURL := k8s.GetKeycloakBaseURL(ctx)
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	adminUser, adminPass := k8s.GetKeycloakAdminCredentials(ctx)
+	if adminUser == "" {
+		adminUser = "admin"
+	}
+	if adminPass == "" {
+		adminPass = "admin"
+	}
+	adminTokenURL := fmt.Sprintf("%s/realms/master/protocol/openid-connect/token", kcURL)
+	form := url.Values{}
+	form.Set("client_id", "admin-cli")
+	form.Set("grant_type", "password")
+	form.Set("username", adminUser)
+	form.Set("password", adminPass)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, adminTokenURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var adminTok oidcTokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&adminTok); err != nil || adminTok.AccessToken == "" {
+		return nil, fmt.Errorf("failed to authenticate with Keycloak Admin API")
+	}
+
+	uURL := fmt.Sprintf("%s/admin/realms/%s/users?max=200", kcURL, k8s.KeycloakRealm)
+	uReq, err := http.NewRequestWithContext(ctx, http.MethodGet, uURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	uReq.Header.Set("Authorization", "Bearer "+adminTok.AccessToken)
+	uResp, err := client.Do(uReq)
+	if err != nil {
+		return nil, err
+	}
+	defer uResp.Body.Close()
+
+	var rawUsers []struct {
+		ID        string `json:"id"`
+		Username  string `json:"username"`
+		Email     string `json:"email"`
+		FirstName string `json:"firstName"`
+		LastName  string `json:"lastName"`
+		Enabled   bool   `json:"enabled"`
+	}
+	if err := json.NewDecoder(uResp.Body).Decode(&rawUsers); err != nil {
+		return nil, err
+	}
+
+	var users []KeycloakUserInfo
+	for _, ru := range rawUsers {
+		userInfo := KeycloakUserInfo{
+			ID:        ru.ID,
+			Username:  ru.Username,
+			Email:     ru.Email,
+			FirstName: ru.FirstName,
+			LastName:  ru.LastName,
+			Enabled:   ru.Enabled,
+		}
+		gURL := fmt.Sprintf("%s/admin/realms/%s/users/%s/groups", kcURL, k8s.KeycloakRealm, ru.ID)
+		gReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, gURL, nil)
+		if gReq != nil {
+			gReq.Header.Set("Authorization", "Bearer "+adminTok.AccessToken)
+			if gResp, err := client.Do(gReq); err == nil {
+				var grps []struct {
+					Name string `json:"name"`
+				}
+				if json.NewDecoder(gResp.Body).Decode(&grps) == nil {
+					for _, g := range grps {
+						userInfo.Groups = append(userInfo.Groups, g.Name)
+					}
+				}
+				gResp.Body.Close()
+			}
+		}
+		users = append(users, userInfo)
+	}
+	return users, nil
+}
+
 

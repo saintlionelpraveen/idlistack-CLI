@@ -232,10 +232,6 @@ func (ps *PortalServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-	defer cancel()
-
-	kcURL := k8s.GetKeycloakBaseURL(ctx)
 	ns := strings.TrimSpace(req.Namespace)
 	if ns == "" && ps.defaultProject != "" {
 		ns = "idlistack-" + strings.ToLower(ps.defaultProject)
@@ -245,7 +241,14 @@ func (ps *PortalServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 		allowedNS = []string{ns}
 	}
 
-	creds, err := LoginWithKeycloak(ctx, kcURL, k8s.KeycloakRealm, k8s.KeycloakClientID, req.Username, req.Password, allowedNS)
+	var creds *Credentials
+	var err error
+
+	// 1. Authenticate directly with Keycloak
+	kcCtx, kcCancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer kcCancel()
+	kcURL := k8s.GetKeycloakBaseURL(kcCtx)
+	creds, err = LoginWithKeycloak(kcCtx, kcURL, k8s.KeycloakRealm, k8s.KeycloakClientID, req.Username, req.Password, allowedNS)
 	if err != nil {
 		json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
 		return
@@ -273,6 +276,8 @@ func (ps *PortalServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Username  string `json:"username"`
 		Email     string `json:"email"`
+		FirstName string `json:"firstName"`
+		LastName  string `json:"lastName"`
 		Password  string `json:"password"`
 		Namespace string `json:"namespace"`
 	}
@@ -282,12 +287,15 @@ func (ps *PortalServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	req.Username = strings.TrimSpace(req.Username)
+	req.Email = strings.TrimSpace(req.Email)
+	req.FirstName = strings.TrimSpace(req.FirstName)
+	req.LastName = strings.TrimSpace(req.LastName)
 	if err := validateAuthInput(req.Username, req.Password); err != nil {
 		json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 
 	ns := strings.TrimSpace(req.Namespace)
@@ -300,7 +308,7 @@ func (ps *PortalServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 		owner := k8s.GetNamespaceOwner(ctx, ns)
 		if owner != "" && owner != "existing-project" {
 			if !UserExistsInKeycloak(ctx, owner) {
-				// Previous owner was deleted in Keycloak: clear orphaned ownership
+				// Previous owner was deleted: clear orphaned ownership
 				_ = exec.CommandContext(ctx, "kubectl", "label", "namespace", ns, "idlistack.io/owner-").Run()
 			} else if !strings.EqualFold(owner, req.Username) {
 				json.NewEncoder(w).Encode(map[string]any{
@@ -312,8 +320,8 @@ func (ps *PortalServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Strictly namespace-scoped developer role (never cluster-admin via portal)
-	creds, err := RegisterAndLoginKeycloakUser(ctx, req.Username, req.Email, req.Password, "developer", ns)
+	// 1. Primary Registration directly in Keycloak (creates realm user in CLI - Deploy group, permanent password, K3s RBAC)
+	creds, err := RegisterAndLoginKeycloakUser(ctx, req.Username, req.Email, req.FirstName, req.LastName, req.Password, "developer", ns)
 	if err != nil {
 		json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
 		return
@@ -421,44 +429,46 @@ const authPortalHTML = `<!DOCTYPE html>
   <title>IdliStack Auth — Keycloak K3s</title>
   <style>
     :root {
-      --bg: #08090d;
-      --card: #0f121a;
-      --border: #1e2434;
-      --border-focus: #3b82f6;
-      --input-bg: #090b10;
-      --input-border: #22293a;
-      --text: #ffffff;
-      --text-dim: #cbd5e1;
-      --muted: #94a3b8;
+      --bg: #f8fafc;
+      --card: #ffffff;
+      --border: #e2e8f0;
+      --border-focus: #2563eb;
+      --input-bg: #ffffff;
+      --input-border: #cbd5e1;
+      --text: #0f172a;
+      --text-dim: #334155;
+      --muted: #64748b;
       --blue: #2563eb;
       --blue-hover: #1d4ed8;
-      --blue-glow: rgba(37, 99, 235, 0.25);
+      --blue-glow: rgba(37, 99, 235, 0.16);
       --green: #10b981;
-      --green-bg: rgba(16, 185, 129, 0.1);
+      --green-bg: #ecfdf5;
       --red: #ef4444;
-      --red-bg: rgba(239, 68, 68, 0.12);
+      --red-bg: #fef2f2;
       --amber: #f59e0b;
-      --amber-bg: rgba(245, 158, 11, 0.1);
+      --amber-bg: #fffbeb;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
       background: var(--bg);
+      background-image: radial-gradient(#e2e8f0 1px, transparent 1px);
+      background-size: 24px 24px;
       color: var(--text);
       min-height: 100vh;
       display: flex;
       align-items: center;
       justify-content: center;
-      padding: 20px;
+      padding: 24px 20px;
     }
     .card {
       width: 100%;
-      max-width: 420px;
+      max-width: 440px;
       background: var(--card);
       border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 32px 28px;
-      box-shadow: 0 24px 48px -12px rgba(0, 0, 0, 0.8), 0 0 0 1px rgba(255, 255, 255, 0.04);
+      border-radius: 16px;
+      padding: 34px 30px;
+      box-shadow: 0 20px 25px -5px rgba(15, 23, 42, 0.08), 0 8px 10px -6px rgba(15, 23, 42, 0.04);
     }
     .brand-header {
       display: flex;
@@ -471,13 +481,13 @@ const authPortalHTML = `<!DOCTYPE html>
       display: inline-flex;
       align-items: center;
       gap: 7px;
-      padding: 6px 12px;
-      background: #141926;
-      border: 1px solid var(--border);
+      padding: 5px 12px;
+      background: #eff6ff;
+      border: 1px solid #bfdbfe;
       border-radius: 9999px;
       font-size: 12px;
-      font-weight: 500;
-      color: var(--text-dim);
+      font-weight: 600;
+      color: #1d4ed8;
       margin-bottom: 12px;
     }
     .keycloak-badge svg {
@@ -486,10 +496,10 @@ const authPortalHTML = `<!DOCTYPE html>
       flex-shrink: 0;
     }
     h1 {
-      font-size: 21px;
+      font-size: 22px;
       font-weight: 700;
       letter-spacing: -0.02em;
-      color: var(--text);
+      color: #0f172a;
       margin-bottom: 4px;
     }
     .subtitle {
@@ -499,9 +509,9 @@ const authPortalHTML = `<!DOCTYPE html>
     .tabs {
       display: grid;
       grid-template-columns: 1fr 1fr;
-      background: #090b10;
+      background: #f1f5f9;
       border: 1px solid var(--border);
-      border-radius: 8px;
+      border-radius: 10px;
       padding: 3px;
       margin-bottom: 16px;
     }
@@ -512,19 +522,20 @@ const authPortalHTML = `<!DOCTYPE html>
       color: var(--muted);
       font-size: 13px;
       font-weight: 600;
-      border-radius: 6px;
+      border-radius: 7px;
       cursor: pointer;
       transition: all 0.15s ease;
     }
     .tab.active {
-      background: #1c2333;
-      color: var(--text);
+      background: #ffffff;
+      color: #0f172a;
+      box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08);
     }
     .ns-pill {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      background: #090b10;
+      background: #f8fafc;
       border: 1px solid var(--border);
       border-radius: 8px;
       padding: 8px 12px;
@@ -532,12 +543,20 @@ const authPortalHTML = `<!DOCTYPE html>
       margin-bottom: 16px;
     }
     .ns-pill span:first-child { color: var(--muted); }
-    .ns-pill code { color: #60a5fa; font-weight: 600; font-family: monospace; }
+    .ns-pill code {
+      color: #2563eb;
+      background: #eff6ff;
+      border: 1px solid #dbeafe;
+      padding: 2px 7px;
+      border-radius: 5px;
+      font-weight: 600;
+      font-family: monospace;
+    }
     
     .owner-lock-banner {
-      background: var(--amber-bg);
-      border: 1px solid rgba(245, 158, 11, 0.35);
-      color: #fde68a;
+      background: #fffbeb;
+      border: 1px solid #fde68a;
+      color: #92400e;
       border-radius: 8px;
       padding: 10px 12px;
       font-size: 12px;
@@ -547,23 +566,32 @@ const authPortalHTML = `<!DOCTYPE html>
     }
 
     .field { margin-bottom: 14px; }
+    .field-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    .req { color: #ef4444; margin-left: 2px; }
     label {
       display: block;
       font-size: 12px;
-      font-weight: 500;
-      color: var(--muted);
+      font-weight: 600;
+      color: #334155;
       margin-bottom: 6px;
     }
     input {
       width: 100%;
-      padding: 11px 12px;
+      padding: 10px 12px;
       background: var(--input-bg);
       border: 1px solid var(--input-border);
       border-radius: 8px;
       color: var(--text);
-      font-size: 14px;
+      font-size: 13.5px;
       outline: none;
       transition: all 0.15s ease;
+    }
+    input::placeholder {
+      color: #94a3b8;
     }
     input:focus {
       border-color: var(--border-focus);
@@ -574,22 +602,36 @@ const authPortalHTML = `<!DOCTYPE html>
       align-items: center;
       gap: 6px;
       font-size: 11.5px;
-      color: var(--muted);
-      margin-top: -6px;
-      margin-bottom: 14px;
+      color: #475569;
+      margin-top: -2px;
+      margin-bottom: 8px;
       padding: 6px 10px;
-      background: #090b10;
-      border: 1px dashed var(--border);
+      background: #f8fafc;
+      border: 1px dashed #cbd5e1;
       border-radius: 6px;
     }
-    .scope-notice strong { color: #60a5fa; }
+    .scope-notice strong { color: #2563eb; }
+    .group-hierarchy-badge {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11.5px;
+      color: #1e3a8a;
+      margin-top: -2px;
+      margin-bottom: 16px;
+      padding: 7px 10px;
+      background: #eff6ff;
+      border: 1px solid #bfdbfe;
+      border-radius: 6px;
+    }
+    .group-hierarchy-badge strong { color: #1d4ed8; }
 
     .btn {
       width: 100%;
-      padding: 12px 14px;
+      padding: 11px 14px;
       border-radius: 8px;
       border: none;
-      font-size: 14px;
+      font-size: 13.5px;
       font-weight: 600;
       cursor: pointer;
       display: flex;
@@ -603,6 +645,7 @@ const authPortalHTML = `<!DOCTYPE html>
       background: var(--blue);
       color: #ffffff;
       margin-top: 4px;
+      box-shadow: 0 1px 2px rgba(37, 99, 235, 0.2);
     }
     .btn-primary:hover:not(:disabled) {
       background: var(--blue-hover);
@@ -611,27 +654,29 @@ const authPortalHTML = `<!DOCTYPE html>
       display: flex;
       align-items: center;
       gap: 12px;
-      margin: 16px 0;
-      color: #475569;
+      margin: 18px 0;
+      color: #94a3b8;
       font-size: 11px;
       text-transform: uppercase;
-      letter-spacing: 0.05em;
+      letter-spacing: 0.06em;
+      font-weight: 600;
     }
     .divider::before, .divider::after {
       content: "";
       flex: 1;
       height: 1px;
-      background: var(--border);
+      background: #e2e8f0;
     }
     .btn-keycloak {
-      background: #111520;
-      color: var(--text);
-      border: 1px solid var(--border);
-      font-size: 13.5px;
+      background: #f8fafc;
+      color: #1e293b;
+      border: 1px solid #cbd5e1;
+      font-size: 13px;
     }
     .btn-keycloak:hover {
-      background: #171d2b;
-      border-color: #3b82f6;
+      background: #f1f5f9;
+      border-color: #2563eb;
+      color: #0f172a;
     }
     .btn-keycloak svg {
       width: 18px;
@@ -642,33 +687,33 @@ const authPortalHTML = `<!DOCTYPE html>
       margin-top: 14px;
       padding: 10px 12px;
       border-radius: 8px;
-      font-size: 13px;
+      font-size: 12.5px;
       text-align: center;
       display: none;
     }
     .msg-error {
-      background: var(--red-bg);
-      border: 1px solid rgba(239, 68, 68, 0.4);
-      color: #fca5a5;
+      background: #fef2f2;
+      border: 1px solid #fecaca;
+      color: #b91c1c;
     }
 
     /* Success / Active Session Card */
     .success-icon {
-      width: 44px;
-      height: 44px;
+      width: 46px;
+      height: 46px;
       border-radius: 50%;
-      background: var(--green-bg);
-      border: 1px solid rgba(16, 185, 129, 0.4);
-      color: #34d399;
+      background: #ecfdf5;
+      border: 1px solid #a7f3d0;
+      color: #059669;
       display: flex;
       align-items: center;
       justify-content: center;
-      font-size: 20px;
+      font-size: 22px;
       margin: 0 auto 12px;
     }
     .info-box {
-      background: #090b10;
-      border: 1px solid var(--border);
+      background: #f8fafc;
+      border: 1px solid #e2e8f0;
       border-radius: 10px;
       padding: 14px;
       margin: 18px 0;
@@ -678,9 +723,11 @@ const authPortalHTML = `<!DOCTYPE html>
       justify-content: space-between;
       font-size: 13px;
       padding: 6px 0;
+      border-bottom: 1px solid #f1f5f9;
     }
+    .info-row:last-child { border-bottom: none; }
     .info-row span:first-child { color: var(--muted); }
-    .info-row span:last-child { font-weight: 600; color: var(--text); }
+    .info-row span:last-child { font-weight: 600; color: #0f172a; }
     .hint {
       font-size: 12px;
       color: var(--muted);
@@ -689,15 +736,16 @@ const authPortalHTML = `<!DOCTYPE html>
       margin-bottom: 14px;
     }
     .btn-outline {
-      background: transparent;
-      color: var(--muted);
-      border: 1px solid var(--border);
+      background: #ffffff;
+      color: #475569;
+      border: 1px solid #cbd5e1;
       margin-top: 8px;
       font-size: 13px;
     }
     .btn-outline:hover {
-      color: var(--text);
-      border-color: #3b82f6;
+      color: #0f172a;
+      background: #f8fafc;
+      border-color: #94a3b8;
     }
   </style>
 </head>
@@ -706,12 +754,12 @@ const authPortalHTML = `<!DOCTYPE html>
     <div id="authView">
       <div class="brand-header">
         <div class="keycloak-badge">
-          <!-- Official Keycloak Shield Icon -->
+          <!-- Official Shield Icon -->
           <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
             <path d="M12 2L4 5.5V11.5C4 16.5 7.4 21.1 12 22.3C16.6 21.1 20 16.5 20 11.5V5.5L12 2Z" fill="#1E293B" stroke="#3B82F6" stroke-width="1.8" stroke-linejoin="round"/>
             <path d="M12 8C10.6 8 9.5 9.1 9.5 10.5C9.5 11.6 10.2 12.5 11.2 12.8V15.5H12.8V12.8C13.8 12.5 14.5 11.6 14.5 10.5C14.5 9.1 13.4 8 12 8Z" fill="#3B82F6"/>
           </svg>
-          <span>Keycloak K3s IAM</span>
+          <span>Keycloak OIDC Auth</span>
         </div>
         <h1>IdliStack Auth</h1>
         <p class="subtitle">Namespace-Scoped Kubernetes RBAC</p>
@@ -743,35 +791,49 @@ const authPortalHTML = `<!DOCTYPE html>
           <input type="password" id="password" placeholder="••••••••" required autocomplete="current-password" />
         </div>
         <button type="submit" class="btn btn-primary" id="submitBtn">Sign In</button>
+        <div class="divider">or</div>
+        <button type="button" class="btn btn-keycloak" id="ssoBtn" onclick="openKeycloakSSO()">
+          <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M12 2L4 5.5V11.5C4 16.5 7.4 21.1 12 22.3C16.6 21.1 20 16.5 20 11.5V5.5L12 2Z" fill="#1E293B" stroke="#2563EB" stroke-width="1.8" stroke-linejoin="round"/>
+            <path d="M12 8C10.6 8 9.5 9.1 9.5 10.5C9.5 11.6 10.2 12.5 11.2 12.8V15.5H12.8V12.8C13.8 12.5 14.5 11.6 14.5 10.5C14.5 9.1 13.4 8 12 8Z" fill="#2563EB"/>
+          </svg>
+          Continue with Keycloak SSO ↗
+        </button>
       </form>
 
       <!-- Namespace-Scoped Registration Form (Strictly Project-Scoped) -->
       <form id="registerForm" style="display:none;" onsubmit="handleRegister(event)">
         <div class="field">
-          <label>New Username</label>
-          <input type="text" id="regUsername" placeholder="e.g. praveen" required autocomplete="username" />
+          <label>Username <span class="req">*</span></label>
+          <input type="text" id="regUsername" placeholder="e.g. praveen" required autocomplete="username" oninput="updateGroupBadge(this.value)" />
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>First Name</label>
+            <input type="text" id="regFirstName" placeholder="First name" autocomplete="given-name" />
+          </div>
+          <div class="field">
+            <label>Last Name</label>
+            <input type="text" id="regLastName" placeholder="Last name" autocomplete="family-name" />
+          </div>
         </div>
         <div class="field">
-          <label>Password</label>
+          <label>Email Address</label>
+          <input type="email" id="regEmail" placeholder="user@company.local" autocomplete="email" />
+        </div>
+        <div class="field">
+          <label>Password <span class="req">*</span></label>
           <input type="password" id="regPassword" placeholder="Create password" required autocomplete="new-password" />
         </div>
         <div class="scope-notice">
           <span>🛡️</span>
           <span>Access Level: <strong>Namespace-Scoped</strong> (this project only)</span>
         </div>
+        <div class="group-hierarchy-badge">
+          <span>📁 Group: <strong>CLI - Deploy</strong></span>
+        </div>
         <button type="submit" class="btn btn-primary" id="regBtn">Create User & Sign In</button>
       </form>
-
-      <div class="divider">or</div>
-
-      <!-- Keycloak SSO Button with Official Keycloak Icon -->
-      <button type="button" class="btn btn-keycloak" onclick="openKeycloakSSO()">
-        <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-          <path d="M12 2L4 5.5V11.5C4 16.5 7.4 21.1 12 22.3C16.6 21.1 20 16.5 20 11.5V5.5L12 2Z" fill="#1E293B" stroke="#3B82F6" stroke-width="1.8" stroke-linejoin="round"/>
-          <path d="M12 8C10.6 8 9.5 9.1 9.5 10.5C9.5 11.6 10.2 12.5 11.2 12.8V15.5H12.8V12.8C13.8 12.5 14.5 11.6 14.5 10.5C14.5 9.1 13.4 8 12 8Z" fill="#3B82F6"/>
-        </svg>
-        <span>Continue with Keycloak SSO ↗</span>
-      </button>
 
       <div id="errorMsg" class="msg msg-error"></div>
     </div>
@@ -787,6 +849,10 @@ const authPortalHTML = `<!DOCTYPE html>
           <span>User</span>
           <span id="okUser">-</span>
         </div>
+        <div class="info-row" id="emailRow" style="display:none;">
+          <span>Email</span>
+          <span id="okEmail" style="color:#cbd5e1;">-</span>
+        </div>
         <div class="info-row">
           <span>RBAC Scope</span>
           <span id="okScope" style="color:#60a5fa;">Namespace-Scoped</span>
@@ -794,6 +860,10 @@ const authPortalHTML = `<!DOCTYPE html>
         <div class="info-row">
           <span>Namespace</span>
           <span id="okNs" style="color:#ffffff; font-family:monospace;">-</span>
+        </div>
+        <div class="info-row">
+          <span>Authority</span>
+          <span id="okGroup" style="color:#38bdf8;">Keycloak (idlistack realm)</span>
         </div>
       </div>
 
@@ -870,10 +940,34 @@ const authPortalHTML = `<!DOCTYPE html>
       }
     }
 
+    function updateGroupBadge(val) {
+      const el = document.getElementById('groupUserChild');
+      if (el) el.textContent = val.trim() || 'user';
+    }
+
+    function openKeycloakSSO() {
+      if (!state.keycloakUrl) {
+        alert('Keycloak service URL is not configured or reachable.');
+        return;
+      }
+      const redirectUri = encodeURIComponent(window.location.origin + window.location.pathname);
+      const authUrl = state.keycloakUrl + '/realms/' + encodeURIComponent(state.realm) +
+        '/protocol/openid-connect/auth?client_id=' + encodeURIComponent(state.clientId) +
+        '&redirect_uri=' + redirectUri +
+        '&response_type=token%20id_token' +
+        '&scope=openid%20profile%20email' +
+        '&nonce=' + Date.now();
+      window.location.href = authUrl;
+    }
+
     function showSignedIn(sess) {
       document.getElementById('authView').style.display = 'none';
       document.getElementById('successView').style.display = 'block';
       document.getElementById('okUser').textContent = sess.username;
+      if (sess.email) {
+        document.getElementById('emailRow').style.display = 'flex';
+        document.getElementById('okEmail').textContent = sess.email;
+      }
       document.getElementById('okScope').textContent = sess.scope === 'cluster-wide' ? 'Cluster-Wide' : 'Namespace-Scoped';
       document.getElementById('okNs').textContent = sess.scope === 'cluster-wide'
         ? 'All Namespaces (*)'
@@ -923,13 +1017,22 @@ const authPortalHTML = `<!DOCTYPE html>
       btn.disabled = true;
       btn.textContent = 'Provisioning user & RBAC...';
 
+      const username = document.getElementById('regUsername').value.trim();
+      const firstName = document.getElementById('regFirstName').value.trim();
+      const lastName = document.getElementById('regLastName').value.trim();
+      const email = document.getElementById('regEmail').value.trim();
+      const password = document.getElementById('regPassword').value;
+
       try {
         const res = await fetch('/api/auth/register', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            username: document.getElementById('regUsername').value.trim(),
-            password: document.getElementById('regPassword').value,
+            username: username,
+            firstName: firstName,
+            lastName: lastName,
+            email: email,
+            password: password,
             namespace: state.namespace
           })
         });
@@ -948,11 +1051,6 @@ const authPortalHTML = `<!DOCTYPE html>
         btn.disabled = false;
         btn.textContent = 'Create User & Sign In';
       }
-    }
-
-    function openKeycloakSSO() {
-      const redirectUri = encodeURIComponent(window.location.origin + '/');
-      window.location.href = state.keycloakUrl + '/realms/' + state.realm + '/protocol/openid-connect/auth?client_id=' + state.clientId + '&redirect_uri=' + redirectUri + '&response_type=token%20id_token&scope=openid%20profile%20email&nonce=' + Date.now();
     }
 
     async function finishSSO() {

@@ -7,7 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased] — v1.9.0
+---
+
+## [v1.10.0] — 2026-10-05
+
+### Added
+- **Keycloak Parent & Child Group Hierarchy (`Idlistack-CLI users`):** All users and project namespaces are structured under the root `Idlistack-CLI users` parent group for easy administrative oversight.
+- **Dynamic User Profile Creation:** Added support for First Name, Last Name, Email, Username, and Password on the registration form.
+- **Light Theme UI/UX Overhaul:** Redesigned the IdliStack Auth Web Portal with a modern, high-contrast Light Theme.
+- **VS Code Extension v1.10.0:** Bundled updated CLI binary and packaged `idlistack-vscode-1.10.0.vsix`.
+
+---
+
+## [v1.9.0] — 2026-10-01
 
 ### Added
 - **Keycloak OIDC Authentication Gate (`idlistack login`, `logout`, `whoami`, `auth`):** Enforces OIDC token verification and Kubernetes RBAC authorization before executing cluster-mutating commands (`init`, `up`, `down`, `status`, `logs`, `env`).

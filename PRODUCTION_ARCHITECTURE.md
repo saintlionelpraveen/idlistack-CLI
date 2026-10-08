@@ -49,7 +49,7 @@ Every execution of `idlistack up` runs through a deterministic 6-stage lifecycle
 ### 3.1. Stage 1: Workspace Validation & Sizing
 - **Config Verification:** Loads `idlistack.toml`. If missing, prompts the user to initialize via `idlistack init` (or generates a preview config when run with `--inspect`).
 - **Ignore Engine:** Recursively scans the directory using `.idlistackignore` (and `.gitignore` as fallback). Excludes heavy artifacts (`node_modules`, `.git`, `__pycache__`, `.venv`, `target`, `dist`).
-- **Dynamic Size Ceiling:** Enforces `currentSize + 500MB` buffer to protect system resources.
+- **Dynamic Size Ceiling:** Enforces `currentSize + 50MB` buffer to protect system resources.
 
 ### 3.2. Stage 2: Multi-Layer Detection Engine
 The detection hierarchy identifies the stack, runtime version, and start commands:

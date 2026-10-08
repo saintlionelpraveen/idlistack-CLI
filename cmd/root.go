@@ -41,9 +41,9 @@ OCI image builds.`, color.New(color.FgHiCyan, color.Bold).Sprint("🚀 IdliStack
 // init, up, down, status, logs, or env commands.
 func enforceKeycloakAuthMiddleware(cmd *cobra.Command, args []string) error {
 	name := cmd.Name()
-	// Exempt login, logout, whoami, auth setup/portal, version, and help
+	// Exempt login, logout, whoami, auth setup/portal, version, admin, and help
 	switch name {
-	case "idlistack", "login", "logout", "whoami", "auth", "setup", "portal", "version", "help":
+	case "idlistack", "login", "logout", "whoami", "auth", "setup", "portal", "admin", "version", "help":
 		return nil
 	}
 	if cmd.Parent() != nil && cmd.Parent().Name() == "auth" {
@@ -63,8 +63,8 @@ func enforceKeycloakAuthMiddleware(cmd *cobra.Command, args []string) error {
 
 	creds, err := auth.VerifyAndAuthorize(cmd.Context(), targetNamespace)
 	if err != nil {
-		ui.Warn(fmt.Sprintf("Keycloak Auth Gate: %v", err))
-		ui.Info("Launching Keycloak authentication flow before executing command...")
+		ui.Warn(fmt.Sprintf("Auth Gate: %v", err))
+		ui.Info("Launching authentication portal before executing command...")
 		if loginErr := runLogin(cmd, args); loginErr != nil {
 			return fmt.Errorf("authentication required to run 'idlistack %s': %w", name, loginErr)
 		}

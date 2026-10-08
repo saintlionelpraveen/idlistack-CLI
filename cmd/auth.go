@@ -42,6 +42,8 @@ var (
 
 	newUserPassword  string
 	newUserEmail     string
+	newUserFirstName string
+	newUserLastName  string
 	newUserRole      string
 	newUserNamespace string
 	newUserAutoLogin bool
@@ -123,6 +125,8 @@ func init() {
 
 	authCreateUserCmd.Flags().StringVarP(&newUserPassword, "password", "p", "", "Password for the new user (required)")
 	authCreateUserCmd.Flags().StringVarP(&newUserEmail, "email", "e", "", "Email address for the new user")
+	authCreateUserCmd.Flags().StringVarP(&newUserFirstName, "first-name", "f", "", "First name for the new user")
+	authCreateUserCmd.Flags().StringVarP(&newUserLastName, "last-name", "l", "", "Last name for the new user")
 	authCreateUserCmd.Flags().StringVarP(&newUserRole, "role", "r", "developer", "RBAC role: 'developer' (Namespace-Scoped) or 'admin' (Cluster-Wide)")
 	authCreateUserCmd.Flags().StringVarP(&newUserNamespace, "namespace", "n", "", "Target K3s namespace (defaults to current project idlistack-<project>)")
 	authCreateUserCmd.Flags().BoolVar(&newUserAutoLogin, "login", true, "Automatically sign in as the newly created user")
@@ -159,7 +163,7 @@ func runAuthCreateUser(cmd *cobra.Command, args []string) error {
 	ui.Info(fmt.Sprintf("Dynamically provisioning user %s in K3s Keycloak...", color.CyanString(username)))
 
 	if newUserAutoLogin {
-		creds, err := auth.RegisterAndLoginKeycloakUser(ctx, username, newUserEmail, newUserPassword, newUserRole, targetNS)
+		creds, err := auth.RegisterAndLoginKeycloakUser(ctx, username, newUserEmail, newUserFirstName, newUserLastName, newUserPassword, newUserRole, targetNS)
 		if err != nil {
 			return err
 		}
@@ -169,7 +173,7 @@ func runAuthCreateUser(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	if err := auth.CreateKeycloakUser(ctx, username, newUserEmail, newUserPassword, newUserRole, targetNS); err != nil {
+	if err := auth.CreateKeycloakUser(ctx, username, newUserEmail, newUserFirstName, newUserLastName, newUserPassword, newUserRole, targetNS); err != nil {
 		return err
 	}
 	fmt.Println()
@@ -304,33 +308,22 @@ func runLogin(cmd *cobra.Command, args []string) error {
 		defaultProject = cfg.Project.Name
 	}
 
-	// Ensure Keycloak is deployed in K3s before logging in
-	kcRunning, kcURL := k8s.IsKeycloakRunning(ctx)
-	if !kcRunning && loginKeycloakURL == "" {
-		ui.Warn("Keycloak is not yet running in K3s namespace 'idlistack-auth'. Deploying it now...")
-		deployedURL, err := k8s.DeployKeycloakToK3s(ctx)
-		if err != nil {
-			ui.Warn(fmt.Sprintf("Automatic Keycloak deployment notice: %v", err))
-		} else {
-			kcURL = deployedURL
-			ui.Success(fmt.Sprintf("Keycloak deployed in K3s at %s", color.CyanString(kcURL)))
-		}
-	}
-
-	if loginKeycloakURL != "" {
-		kcURL = loginKeycloakURL
+	// Ensure Keycloak URL is resolved
+	kcURL := loginKeycloakURL
+	if kcURL == "" {
+		kcURL = k8s.GetKeycloakBaseURL(ctx)
 	}
 
 	// Non-interactive or terminal CLI mode
 	if loginCliOnly || (loginUsername != "" && loginPassword != "") {
 		reader := bufio.NewReader(os.Stdin)
 		if loginUsername == "" {
-			fmt.Printf("  Keycloak Username (e.g. admin / developer): ")
+			fmt.Printf("  Username (e.g. admin / developer): ")
 			u, _ := reader.ReadString('\n')
 			loginUsername = strings.TrimSpace(u)
 		}
 		if loginPassword == "" {
-			fmt.Printf("  Keycloak Password: ")
+			fmt.Printf("  Password: ")
 			p, _ := reader.ReadString('\n')
 			loginPassword = strings.TrimSpace(p)
 		}
@@ -342,8 +335,10 @@ func runLogin(cmd *cobra.Command, args []string) error {
 			allowedNS = []string{fmt.Sprintf("idlistack-%s", strings.ToLower(defaultProject))}
 		}
 
-		ui.Info(fmt.Sprintf("Authenticating %s with Keycloak at %s ...", color.CyanString(loginUsername), kcURL))
-		creds, err := auth.LoginWithKeycloak(ctx, kcURL, k8s.KeycloakRealm, k8s.KeycloakClientID, loginUsername, loginPassword, allowedNS)
+		ui.Info(fmt.Sprintf("Authenticating %s with Keycloak ...", color.CyanString(loginUsername)))
+		quickCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		creds, err := auth.LoginWithKeycloak(quickCtx, kcURL, k8s.KeycloakRealm, k8s.KeycloakClientID, loginUsername, loginPassword, allowedNS)
 		if err != nil {
 			return err
 		}
@@ -359,9 +354,8 @@ func runLogin(cmd *cobra.Command, args []string) error {
 
 	ui.PrintDivider()
 	fmt.Println()
-	color.New(color.FgHiCyan, color.Bold).Printf("  🔐 IdliStack Auth Frontend: %s\n", portalURL)
-	ui.Detail("Keycloak Cluster URL: %s (Realm: %s)", kcURL, k8s.KeycloakRealm)
-	ui.Detail("Opening authentication frontend in your browser...")
+	color.New(color.FgHiCyan, color.Bold).Printf("  🔐 IdliStack Auth: %s\n", portalURL)
+	ui.Detail("Opening authentication portal in your browser...")
 	_ = auth.OpenBrowserURL(loginBrowserURL)
 	fmt.Println()
 	ui.Info("Waiting for authentication in browser (or press Ctrl+C to cancel)...")

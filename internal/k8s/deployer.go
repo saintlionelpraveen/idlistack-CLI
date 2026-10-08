@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -509,24 +510,24 @@ spec:
         startupProbe:
           tcpSocket:
             port: %[5]d
-          initialDelaySeconds: 5
-          periodSeconds: 5
+          initialDelaySeconds: 1
+          periodSeconds: 2
           failureThreshold: 30
-          timeoutSeconds: 3
+          timeoutSeconds: 2
         livenessProbe:
           tcpSocket:
             port: %[5]d
           initialDelaySeconds: 0
           periodSeconds: 15
           failureThreshold: 3
-          timeoutSeconds: 3
+          timeoutSeconds: 2
         readinessProbe:
           tcpSocket:
             port: %[5]d
           initialDelaySeconds: 0
-          periodSeconds: 5
+          periodSeconds: 2
           failureThreshold: 3
-          timeoutSeconds: 3%[10]s%[11]s%[12]s%[13]s
+          timeoutSeconds: 2%[10]s%[11]s%[12]s%[13]s
 `,
 		d.appName,                   // 1
 		d.namespace,                 // 2
@@ -597,11 +598,27 @@ func (d *Deployer) helmCmd(ctx context.Context, args ...string) *exec.Cmd {
 func (d *Deployer) executeHelmDeploy(ctx context.Context) error {
 	helmDir := filepath.Join(d.projectDir, ".idlistack", "helm")
 
-	// Helm timeout must exceed the startup probe window + buffer.
-	// startupProbe: failureThreshold(30) * periodSeconds(5) = 150s
-	// Buffer: 150s → total 300s. This prevents the race condition where
-	// Helm's deadline fires before Kubernetes finishes probing.
-	helmTimeout := "300s"
+	helmTimeout := "180s"
+
+	rolloutCtx, cancelRollout := context.WithCancel(ctx)
+	defer cancelRollout()
+
+	// Stream rollout progress in real-time so user sees live container deployment status
+	go func() {
+		time.Sleep(1200 * time.Millisecond)
+		select {
+		case <-rolloutCtx.Done():
+			return
+		default:
+		}
+
+		rolloutCmd := exec.CommandContext(rolloutCtx, "kubectl", "rollout", "status",
+			fmt.Sprintf("deployment/%s", d.appName),
+			"-n", d.namespace, "--watch=true")
+		rolloutCmd.Stdout = os.Stdout
+		rolloutCmd.Stderr = os.Stderr
+		_ = rolloutCmd.Run()
+	}()
 
 	cmd := d.helmCmd(ctx, "upgrade", "--install", d.appName, helmDir,
 		"--namespace", d.namespace,
@@ -610,7 +627,9 @@ func (d *Deployer) executeHelmDeploy(ctx context.Context) error {
 		"--atomic") // auto-rollback on failure; auto-purge on failed first install
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	err := cmd.Run()
+	cancelRollout()
+	return err
 }
 
 func (d *Deployer) rollback(ctx context.Context) {
@@ -746,6 +765,28 @@ func (d *Deployer) getServiceURL(ctx context.Context) string {
 }
 
 func (d *Deployer) getNodeIP(ctx context.Context) string {
+	// 1. Check if kubeconfig points to a remote host (if custom cluster host is configured)
+	cmdSrv := exec.CommandContext(ctx, "kubectl", "config", "view", "--minify", "-o", "jsonpath={.clusters[0].cluster.server}")
+	if outSrv, err := cmdSrv.Output(); err == nil {
+		rawServer := strings.TrimSpace(string(outSrv))
+		if u, err := url.Parse(rawServer); err == nil && u.Hostname() != "" {
+			h := u.Hostname()
+			if h != "127.0.0.1" && h != "localhost" && h != "0.0.0.0" {
+				return h
+			}
+		}
+	}
+
+	// 2. Check node ExternalIP
+	cmdExt := exec.CommandContext(ctx, "kubectl", "get", "nodes", "-o", `jsonpath={.items[0].status.addresses[?(@.type=="ExternalIP")].address}`)
+	if outExt, err := cmdExt.Output(); err == nil {
+		extIp := strings.TrimSpace(string(outExt))
+		if extIp != "" {
+			return strings.Fields(extIp)[0]
+		}
+	}
+
+	// 3. Fallback to node InternalIP
 	cmdIp := exec.CommandContext(ctx, "kubectl", "get", "nodes", "-o", `jsonpath={.items[0].status.addresses[?(@.type=="InternalIP")].address}`)
 	outIp, err := cmdIp.Output()
 	if err != nil {
@@ -1217,16 +1258,16 @@ spec:
         startupProbe:
           exec:
             command: ["mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p%[3]s"]
-          initialDelaySeconds: 5
-          periodSeconds: 5
+          initialDelaySeconds: 2
+          periodSeconds: 2
           failureThreshold: 30
-          timeoutSeconds: 3
+          timeoutSeconds: 2
         readinessProbe:
           exec:
             command: ["mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p%[3]s"]
-          initialDelaySeconds: 5
-          periodSeconds: 5
-          timeoutSeconds: 3
+          initialDelaySeconds: 2
+          periodSeconds: 2
+          timeoutSeconds: 2
         livenessProbe:
           exec:
             command: ["mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p%[3]s"]

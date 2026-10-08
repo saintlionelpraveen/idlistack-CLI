@@ -73,8 +73,10 @@ func runUp(cmd *cobra.Command, args []string) error {
 			}
 			ui.Detail("Project: %s (preview)", color.CyanString(cfg.Project.Name))
 		} else {
-			ui.Error("Project not initialized. Run 'idlistack init' first.")
-			return fmt.Errorf("no idlistack.toml found: %w", err)
+			cfg, err = EnsureProjectInitialized(ctx, cwd)
+			if err != nil {
+				return fmt.Errorf("auto-initialization failed: %w", err)
+			}
 		}
 	} else {
 		ui.Detail("Project: %s", color.CyanString(cfg.Project.Name))
@@ -85,8 +87,8 @@ func runUp(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to calculate source size: %w", err)
 	}
-	// Dynamic limit: Current size + 500MB buffer
-	maxSize := sourceSize + int64(500*1024*1024) 
+	// Dynamic limit: Current size + 50MB buffer
+	maxSize := sourceSize + int64(50*1024*1024) 
 	if sourceSize > maxSize {
 		ui.Error(fmt.Sprintf("Source directory exceeds dynamic limit (%s). Check .idlistackignore.", formatBytes(sourceSize)))
 		return fmt.Errorf("source too large: %s", formatBytes(sourceSize))
@@ -652,17 +654,7 @@ func ensureK3sRunning(ctx context.Context) error {
 	return fmt.Errorf("K3s containerd socket is not responding. Restart it with: sudo systemctl restart k3s")
 }
 
-func loadIntoK3s(ctx context.Context, imageTag string) error {
-	// If it's a pre-built public registry image, K3s containerd will pull it directly
-	if !strings.HasPrefix(imageTag, "idlistack/") {
-		ui.Detail("K3s containerd will use/pull %s directly", color.CyanString(imageTag))
-		return nil
-	}
-
-	if err := ensureK3sRunning(ctx); err != nil {
-		return err
-	}
-
+func fallbackTarLoad(ctx context.Context, imageTag string) error {
 	tarPath := fmt.Sprintf("/tmp/idlistack-%d.tar", time.Now().UnixNano())
 	saveCmd := exec.CommandContext(ctx, "docker", "save", imageTag, "-o", tarPath)
 	saveCmd.Stdout = os.Stdout
@@ -675,12 +667,14 @@ func loadIntoK3s(ctx context.Context, imageTag string) error {
 	// Try without sudo first
 	directCmd := exec.CommandContext(ctx, "k3s", "ctr", "images", "import", tarPath)
 	if err := directCmd.Run(); err == nil {
+		ui.Success(fmt.Sprintf("Image %s imported into local K3s containerd", color.CyanString(imageTag)))
 		return nil
 	}
 
 	// Try non-interactive sudo
 	sudoNCmd := exec.CommandContext(ctx, "sudo", "-n", "k3s", "ctr", "images", "import", tarPath)
 	if err := sudoNCmd.Run(); err == nil {
+		ui.Success(fmt.Sprintf("Image %s imported into local K3s containerd", color.CyanString(imageTag)))
 		return nil
 	}
 
@@ -692,7 +686,45 @@ func loadIntoK3s(ctx context.Context, imageTag string) error {
 	if err := importCmd.Run(); err != nil {
 		return fmt.Errorf("failed to import image into K3s: %w (Ensure K3s is running: sudo systemctl start k3s)", err)
 	}
+	ui.Success(fmt.Sprintf("Image %s imported into local K3s containerd", color.CyanString(imageTag)))
 	return nil
+}
+
+func loadIntoK3s(ctx context.Context, imageTag string) error {
+	// If it's a pre-built public registry image, K3s containerd will pull it directly
+	if !strings.HasPrefix(imageTag, "idlistack/") {
+		ui.Detail("K3s containerd will use/pull %s directly", color.CyanString(imageTag))
+		return nil
+	}
+
+	ui.Detail("Importing image %s into local K3s containerd...", color.CyanString(imageTag))
+	saveCmd := exec.CommandContext(ctx, "docker", "save", imageTag)
+	importCmd := exec.CommandContext(ctx, "k3s", "ctr", "images", "import", "-")
+
+	r, w := io.Pipe()
+	saveCmd.Stdout = w
+	saveCmd.Stderr = os.Stderr
+	importCmd.Stdin = r
+	importCmd.Stdout = io.Discard
+	importCmd.Stderr = os.Stderr
+
+	if err := saveCmd.Start(); err != nil {
+		return fmt.Errorf("failed to start docker save: %w", err)
+	}
+	if err := importCmd.Start(); err == nil {
+		saveErr := saveCmd.Wait()
+		_ = w.Close()
+		importErr := importCmd.Wait()
+		if saveErr == nil && importErr == nil {
+			ui.Success(fmt.Sprintf("Image %s loaded into K3s containerd", color.CyanString(imageTag)))
+			return nil
+		}
+	} else {
+		_ = w.Close()
+		_ = saveCmd.Wait()
+	}
+
+	return fallbackTarLoad(ctx, imageTag)
 }
 
 func ensureHostDockerImage(ctx context.Context, img string) {
