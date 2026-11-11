@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/fatih/color"
+	"github.com/idlistack/cli/internal/auth"
 	"github.com/idlistack/cli/internal/buildplan"
 	"github.com/idlistack/cli/internal/config"
 	"github.com/idlistack/cli/internal/detect"
@@ -41,13 +42,15 @@ Use --detach to run the deployment in the background.`,
 }
 
 var (
-	upInspect bool
-	upDetach  bool
+	upInspect  bool
+	upDetach   bool
+	upRegistry string
 )
 
 func init() {
 	upCmd.Flags().BoolVar(&upInspect, "inspect", false, "Preview the build plan without building or deploying")
 	upCmd.Flags().BoolVarP(&upDetach, "detach", "d", false, "Run deployment in the background")
+	upCmd.Flags().StringVar(&upRegistry, "registry", "", "Container registry to push image for remote clusters (e.g. docker.io/username)")
 }
 
 func runUp(cmd *cobra.Command, args []string) error {
@@ -81,6 +84,9 @@ func runUp(cmd *cobra.Command, args []string) error {
 	} else {
 		ui.Detail("Project: %s", color.CyanString(cfg.Project.Name))
 	}
+
+	// Dynamically align cfg.Deploy.Namespace with active kubecontext
+	cfg.Deploy.Namespace = k8s.ResolveNamespace(ctx, cfg.Deploy.Namespace, cfg.Project.Name)
 
 	// Check source size (50MB limit)
 	sourceSize, err := calculateDirSize(cwd)
@@ -143,10 +149,22 @@ func runUp(cmd *cobra.Command, args []string) error {
 		fmt.Println(string(planJSON))
 		fmt.Println()
 
-		// Save plan to .idlistack/buildplan.json
-		planPath := filepath.Join(cwd, ".idlistack", "buildplan.json")
-		os.WriteFile(planPath, planJSON, 0644)
-		ui.Info(fmt.Sprintf("Plan saved to %s", color.HiBlackString(planPath)))
+		// Save plan to .idlistack.json
+		targetNS := k8s.ResolveNamespace(ctx, cfg.Deploy.Namespace, cfg.Project.Name)
+		state, _ := config.LoadProjectState(cwd)
+		if state == nil {
+			state = &config.ProjectState{
+				Version:     "1.0",
+				ProjectName: cfg.Project.Name,
+				ProjectDir:  cwd,
+				Namespace:   targetNS,
+			}
+		}
+		state.Plan = plan
+		state.Namespace = targetNS
+		state.Deploy.Namespace = targetNS
+		_ = config.SaveProjectState(cwd, state)
+		ui.Info(fmt.Sprintf("Plan saved to %s", color.HiBlackString(config.ProjectStateFileName)))
 
 		confidenceColor := color.GreenString
 		if plan.DetectionConfidence == "medium" {
@@ -163,13 +181,24 @@ func runUp(cmd *cobra.Command, args []string) error {
 	// ─── Step 3: Save Build Plan ────────────────────────────────────
 	ui.Step(3, 6, "Generating build plan")
 
-	planJSON, _ := json.MarshalIndent(plan, "", "  ")
-	planPath := filepath.Join(cwd, ".idlistack", "buildplan.json")
-	os.MkdirAll(filepath.Join(cwd, ".idlistack"), 0755)
-	if err := os.WriteFile(planPath, planJSON, 0644); err != nil {
-		return fmt.Errorf("failed to save build plan: %w", err)
+	targetNS := k8s.ResolveNamespace(ctx, cfg.Deploy.Namespace, cfg.Project.Name)
+	state, _ := config.LoadProjectState(cwd)
+	if state == nil {
+		state = &config.ProjectState{
+			Version:     "1.0",
+			ProjectName: cfg.Project.Name,
+			ProjectDir:  cwd,
+			Namespace:   targetNS,
+		}
 	}
-	ui.Detail("Plan saved to %s", color.HiBlackString(".idlistack/buildplan.json"))
+	state.Plan = plan
+	state.ProjectName = cfg.Project.Name
+	state.Namespace = targetNS
+	state.Deploy.Namespace = targetNS
+	if err := config.SaveProjectState(cwd, state); err != nil {
+		return fmt.Errorf("failed to save project state: %w", err)
+	}
+	ui.Detail("Plan saved to %s", color.HiBlackString(config.ProjectStateFileName))
 
 	// ─── Step 4: Build OCI Image ────────────────────────────────────
 	ui.Step(4, 6, "Building OCI image")
@@ -180,7 +209,10 @@ func runUp(cmd *cobra.Command, args []string) error {
 
 	imageTag := fmt.Sprintf("idlistack/%s:%s", strings.ToLower(cfg.Project.Name), generateDeployHash())
 
-	if plan.ComposeImage != "" {
+	if cfg.Deploy.Image != "" {
+		imageTag = cfg.Deploy.Image
+		ui.Detail("Using configured image: %s", color.CyanString(imageTag))
+	} else if plan.ComposeImage != "" {
 		// Compose-based deployment: use the pre-built image from registry
 		imageTag = plan.ComposeImage
 		ui.Detail("Using pre-built registry image: %s", color.CyanString(plan.ComposeImage))
@@ -230,25 +262,74 @@ func runUp(cmd *cobra.Command, args []string) error {
 
 	k8s.EnsureK3sContext(ctx)
 	deployer := k8s.NewDeployer(cfg, plan, imageTag, cwd)
-	requiredImages := deployer.GetRequiredImages()
 
-	for _, img := range requiredImages {
-		if !strings.HasPrefix(img, "idlistack/") {
-			ensureHostDockerImage(ctx, img)
+	if deployer.IsRemoteCluster(ctx) {
+		ui.Detail("Remote cluster detected (%s): skipping local containerd sideload", color.CyanString(deployer.Namespace()))
+		registry := upRegistry
+		if registry == "" {
+			registry = os.Getenv("IDLISTACK_REGISTRY")
 		}
-		if err := loadIntoK3s(ctx, img); err != nil {
-			return fmt.Errorf("K3s image load failed for %s: %w", img, err)
+		if registry == "" {
+			registry = cfg.Deploy.Registry
 		}
+		if registry != "" {
+			remoteTag := fmt.Sprintf("%s/%s:%s", strings.TrimSuffix(registry, "/"), deployer.AppName(), generateDeployHash())
+			ui.Detail("Pushing image to external registry: %s", color.CyanString(remoteTag))
+			if tagCmd := exec.CommandContext(ctx, "docker", "tag", imageTag, remoteTag); tagCmd.Run() == nil {
+				pushCmd := exec.CommandContext(ctx, "docker", "push", remoteTag)
+				pushCmd.Stdout = os.Stdout
+				pushCmd.Stderr = os.Stderr
+				if err := pushCmd.Run(); err != nil {
+					return fmt.Errorf("failed to push image to %s: %w", remoteTag, err)
+				}
+				deployer.SetImageTag(remoteTag)
+				imageTag = remoteTag
+				ui.Success(fmt.Sprintf("Image pushed to %s", color.CyanString(remoteTag)))
+			}
+		} else {
+			// Auto in-cluster private OCI registry inside target namespace
+			ui.Detail("Using in-cluster private OCI registry in namespace %s", color.CyanString(deployer.Namespace()))
+			remoteTag, err := k8s.PushToInClusterRegistry(ctx, deployer.Namespace(), imageTag, deployer.AppName(), generateDeployHash())
+			if err != nil {
+				return fmt.Errorf("failed to push image to in-cluster registry: %w", err)
+			}
+			deployer.SetImageTag(remoteTag)
+			imageTag = remoteTag
+		}
+	} else {
+		requiredImages := deployer.GetRequiredImages()
+		for _, img := range requiredImages {
+			if !strings.HasPrefix(img, "idlistack/") {
+				ensureHostDockerImage(ctx, img)
+			}
+			if err := loadIntoK3s(ctx, img); err != nil {
+				return fmt.Errorf("K3s image load failed for %s: %w", img, err)
+			}
+		}
+		ui.Detail("All images loaded into K3s containerd")
 	}
-	ui.Detail("All images loaded into K3s containerd")
 
 	// ─── Step 6: Deploy to K3s via Helm ──────────────────────────────────
 	ui.Step(6, 6, "Deploying to K3s via Helm")
 
 	url, err := deployer.Deploy(ctx, Verbose)
 	if err != nil {
+		auth.RecordDeploymentOutcome(ctx, deployer.AppName(), deployer.Namespace(), imageTag, deployer.AppName(), "Failed", "", err.Error())
 		return fmt.Errorf("deployment failed: %w", err)
 	}
+
+	// Report successful deployment to Frappe backend
+	auth.RecordDeploymentOutcome(ctx, deployer.AppName(), deployer.Namespace(), imageTag, deployer.AppName(), "Deployed", url, "Successfully rolled out")
+
+	// Persist outcome in .idlistack.json
+	if state, _ := config.LoadProjectState(cwd); state != nil {
+		state.LastDeploy = time.Now().UTC().Format(time.RFC3339)
+		state.LastImage = imageTag
+		state.LastStatus = "deployed"
+		state.AccessURL = url
+		_ = config.SaveProjectState(cwd, state)
+	}
+	_ = os.RemoveAll(filepath.Join(cwd, ".idlistack"))
 
 	// ─── Success ────────────────────────────────────────────────────
 	elapsed := time.Since(startTime).Round(time.Millisecond)
@@ -301,7 +382,7 @@ func calculateDirSize(path string) (int64, error) {
 
 func loadIgnorePatterns(projectDir string) []string {
 	defaults := []string{
-		".git", ".idlistack", "node_modules", "__pycache__",
+		".git", ".idlistack", ".idlistack.json", "node_modules", "__pycache__",
 		".next", "dist", "build", ".venv", "venv",
 		"target", "vendor", ".cargo", ".gradle",
 	}
@@ -405,7 +486,7 @@ func ensureDockerignore(projectDir string) {
 
 	ignorePatterns := loadIgnorePatterns(projectDir)
 	ignoreContent := strings.Join(ignorePatterns, "\n")
-	ignoreContent += "\n.vscode-server-data\n*.sock\n.git\n.idlistack\n"
+	ignoreContent += "\n.vscode-server-data\n*.sock\n.git\n.idlistack\n.idlistack.json\n"
 	os.WriteFile(dockerignorePath, []byte(ignoreContent), 0644)
 	ui.Detail("Created .dockerignore to optimize build context")
 }
@@ -436,11 +517,16 @@ func buildWithGeneratedDockerfile(ctx context.Context, projectDir, imageTag stri
 	}
 
 	// Install Command
-	if plan.InstallCmd != "" {
+	if plan.Provider == "node" {
+		if _, err := os.Stat(filepath.Join(projectDir, "pnpm-lock.yaml")); err == nil {
+			df.WriteString("RUN corepack enable && pnpm install\n")
+		} else if _, err := os.Stat(filepath.Join(projectDir, "yarn.lock")); err == nil {
+			df.WriteString("RUN yarn install\n")
+		} else {
+			df.WriteString("RUN npm install || npm ci\n")
+		}
+	} else if plan.InstallCmd != "" {
 		df.WriteString(fmt.Sprintf("RUN %s\n", plan.InstallCmd))
-	} else if plan.Provider == "node" {
-		// Generic fallback to rebuild native modules (like better-sqlite3) dynamically
-		df.WriteString("RUN npm rebuild || true\n")
 	}
 
 	// Build Command
@@ -499,12 +585,12 @@ func buildWithGeneratedDockerfile(ctx context.Context, projectDir, imageTag stri
 		}
 	}
 
-	// Write generated Dockerfile
-	tmpDockerfilePath := filepath.Join(projectDir, ".idlistack", "Dockerfile.generated")
-	os.MkdirAll(filepath.Join(projectDir, ".idlistack"), 0755)
+	// Write generated Dockerfile to transient temp file
+	tmpDockerfilePath := filepath.Join(os.TempDir(), fmt.Sprintf("Dockerfile.%s.%d.generated", filepath.Base(projectDir), time.Now().UnixNano()))
 	if err := os.WriteFile(tmpDockerfilePath, []byte(df.String()), 0644); err != nil {
 		return fmt.Errorf("failed to write generated Dockerfile: %w", err)
 	}
+	defer os.Remove(tmpDockerfilePath)
 
 	ui.Detail("Generated Dockerfile:")
 	for _, line := range strings.Split(df.String(), "\n") {

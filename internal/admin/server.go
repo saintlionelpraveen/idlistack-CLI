@@ -314,7 +314,7 @@ func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
 		"totalPods":       totalPods,
 		"totalNamespaces": totalNamespaces,
 		"nodeHost":        s.nodeHost,
-		"keycloakUrl":     k8s.GetKeycloakBaseURL(ctx),
+		"frappeUrl":       auth.DefaultFrappeURL(),
 	}
 
 	_ = json.NewEncoder(w).Encode(res)
@@ -659,8 +659,8 @@ func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
 	var users []TenantUser
 	existingUsernames := make(map[string]bool)
 
-	// Fetch users directly from Keycloak
-	kcUsers, err := auth.ListKeycloakUsers(ctx)
+	// Fetch users directly from Frappe
+	kcUsers, err := auth.ListFrappeUsers(ctx)
 	if err == nil {
 		for _, ku := range kcUsers {
 			role := "developer"
@@ -729,7 +729,7 @@ func (s *Server) handleUserCreate(w http.ResponseWriter, r *http.Request) {
 		req.Role = "developer"
 	}
 
-	err := auth.CreateKeycloakUser(ctx, req.Username, req.Email, req.Username, "User", req.Password, req.Role, req.Namespace)
+	err := auth.CreateFrappeUser(ctx, req.Username, req.Email, req.Username, "User", req.Password, req.Role, req.Namespace)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error": "%v"}`, err), http.StatusInternalServerError)
 		return

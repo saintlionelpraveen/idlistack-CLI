@@ -196,11 +196,13 @@ func VerifyDeployAuthAndGetToken(ctx context.Context, targetNamespace string) (s
 	credPath := filepath.Join(home, ".idlistack", "credentials.json")
 	data, err := os.ReadFile(credPath)
 	if err != nil {
-		return "", "", "", fmt.Errorf("not authenticated with Keycloak: run 'idlistack login' before deploying to K3s")
+		return "", "", "", fmt.Errorf("not authenticated: run 'idlistack login' before deploying to K3s")
 	}
 
 	var creds struct {
+		User              string    `json:"user"`
 		Username          string    `json:"username"`
+		SessionToken      string    `json:"sessionToken"`
 		Groups            []string  `json:"groups"`
 		Scope             string    `json:"scope"`
 		AllowedNamespaces []string  `json:"allowedNamespaces"`
@@ -211,37 +213,68 @@ func VerifyDeployAuthAndGetToken(ctx context.Context, targetNamespace string) (s
 		return "", "", "", fmt.Errorf("invalid credentials file: run 'idlistack login'")
 	}
 
-	if time.Now().After(creds.ExpiresAt) {
-		return "", "", "", fmt.Errorf("Keycloak token expired at %s: run 'idlistack login'", creds.ExpiresAt.Format(time.RFC1123))
+	user := creds.Username
+	if user == "" {
+		user = creds.User
+	}
+	if user == "" {
+		return "", "", "", fmt.Errorf("no user found in credentials: run 'idlistack login'")
 	}
 
-	k8sToken, err := EnsureNamespaceRBAC(ctx, creds.Username, creds.Groups, creds.AllowedNamespaces, targetNamespace)
-	if err != nil {
-		return "", "", "", err
+	if time.Now().After(creds.ExpiresAt) {
+		return "", "", "", fmt.Errorf("session token expired at %s: run 'idlistack login'", creds.ExpiresAt.Format(time.RFC1123))
+	}
+
+	scope := creds.Scope
+	if scope == "" {
+		scope = "namespace-scoped"
+	}
+
+	k8sToken, err := EnsureNamespaceRBAC(ctx, user, creds.Groups, creds.AllowedNamespaces, targetNamespace)
+	if err != nil && !strings.Contains(err.Error(), "already exists") {
+		// Non-fatal if cluster RBAC is handled via Teleport
+		if k8sToken == "" {
+			k8sToken = creds.K8sToken
+		}
 	}
 	if k8sToken == "" {
 		k8sToken = creds.K8sToken
 	}
 
-	return k8sToken, creds.Username, creds.Scope, nil
+	return k8sToken, user, scope, nil
 }
 
 // EnsureK3sContext ensures kubectl is targeting an active and responsive context.
 func EnsureK3sContext(ctx context.Context) {
+	if os.Getenv("KUBECONFIG") != "" {
+		return
+	}
+
 	quickCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
+	// 1. If current-context is already set and responsive, preserve it!
 	ctxCmd := exec.CommandContext(quickCtx, "kubectl", "config", "current-context")
 	out, err := ctxCmd.Output()
 	curr := strings.TrimSpace(string(out))
 	if err == nil && curr != "" {
-		if exec.CommandContext(quickCtx, "kubectl", "get", "nodes").Run() == nil {
+		// Test if current context is responsive (probe pods for namespace-scoped clusters, or nodes)
+		if exec.CommandContext(quickCtx, "kubectl", "get", "pods", "--request-timeout=2s").Run() == nil {
+			return
+		}
+		if exec.CommandContext(quickCtx, "kubectl", "get", "nodes", "--request-timeout=2s").Run() == nil {
 			return
 		}
 	}
-	// Check if K3s "default" context is available and responsive
+
+	// 2. Only if no active context is set or it fails, fallback to local K3s contexts
+	if exec.CommandContext(quickCtx, "kubectl", "--context", "local-k3s", "get", "nodes").Run() == nil {
+		_ = exec.CommandContext(quickCtx, "kubectl", "config", "use-context", "local-k3s").Run()
+		return
+	}
 	if exec.CommandContext(quickCtx, "kubectl", "--context", "default", "get", "nodes").Run() == nil {
 		_ = exec.CommandContext(quickCtx, "kubectl", "config", "use-context", "default").Run()
+		return
 	}
 }
 
@@ -462,6 +495,11 @@ func GetNamespaceOwner(ctx context.Context, namespace string) string {
 // EnsureNamespaceRBAC provisions a Kubernetes ServiceAccount, Role, and RoleBinding (or ClusterRoleBinding)
 // for the authenticated Keycloak user so Helm and kubectl commands enforce cluster-wide or namespace-scoped RBAC.
 func EnsureNamespaceRBAC(ctx context.Context, username string, groups []string, allowedNamespaces []string, targetNamespace string) (string, error) {
+	if targetNamespace != "" && !strings.HasPrefix(targetNamespace, "idlistack-") && (IsClusterRemote(ctx) || targetNamespace == GetActiveKubeNamespace(ctx)) {
+		// Custom or vendor namespace; preserve as is
+	} else if targetNamespace != "" {
+		targetNamespace = SanitizeK8sNamespace(targetNamespace)
+	}
 	EnsureK3sContext(ctx)
 	saName := sanitizeK8sName(fmt.Sprintf("idlistack-user-%s", username))
 	isClusterAdmin := false
@@ -494,15 +532,31 @@ func EnsureNamespaceRBAC(ctx context.Context, username string, groups []string, 
 	quickCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
+	home, _ := os.UserHomeDir()
+	adminArgs := []string{}
+	for _, adminKc := range []string{
+		filepath.Join(home, ".kube", "config"),
+		filepath.Join(home, ".idlistack", "k3s-kubeconfig.yaml"),
+		"/etc/rancher/k3s/k3s.yaml",
+	} {
+		if _, statErr := os.Stat(adminKc); statErr == nil {
+			adminArgs = append(adminArgs, "--kubeconfig="+adminKc)
+			break
+		}
+	}
+
 	// Ensure idlistack-auth namespace exists to hold user ServiceAccounts
-	_ = exec.CommandContext(quickCtx, "kubectl", "create", "namespace", KeycloakNamespace).Run()
+	createAuthArgs := append([]string{"create", "namespace", KeycloakNamespace}, adminArgs...)
+	_ = exec.CommandContext(quickCtx, "kubectl", createAuthArgs...).Run()
 
 	// Ensure target namespace exists if specified
 	if targetNamespace != "" {
-		_ = exec.CommandContext(quickCtx, "kubectl", "create", "namespace", targetNamespace).Run()
+		createNsArgs := append([]string{"create", "namespace", targetNamespace}, adminArgs...)
+		_ = exec.CommandContext(quickCtx, "kubectl", createNsArgs...).Run()
 		// Label the owner of this project namespace if not already labeled
 		if existingOwner := GetNamespaceOwner(quickCtx, targetNamespace); existingOwner == "" || existingOwner == "existing-project" {
-			_ = exec.CommandContext(quickCtx, "kubectl", "label", "namespace", targetNamespace, fmt.Sprintf("idlistack.io/owner=%s", sanitizeK8sName(username)), "--overwrite").Run()
+			labelArgs := append([]string{"label", "namespace", targetNamespace, fmt.Sprintf("idlistack.io/owner=%s", sanitizeK8sName(username)), "--overwrite"}, adminArgs...)
+			_ = exec.CommandContext(quickCtx, "kubectl", labelArgs...).Run()
 		}
 	}
 
@@ -627,7 +681,8 @@ roleRef:
 `, saName, KeycloakNamespace, username, targetNamespace))
 	}
 
-	applyCmd := exec.CommandContext(quickCtx, "kubectl", "apply", "-f", "-")
+	applyArgs := append([]string{"apply", "-f", "-"}, adminArgs...)
+	applyCmd := exec.CommandContext(quickCtx, "kubectl", applyArgs...)
 	applyCmd.Stdin = bytes.NewBufferString(rbacManifest.String())
 	if _, err := applyCmd.CombinedOutput(); err != nil {
 		// Cluster may be temporarily offline or starting up; return gracefully without breaking IAM auth session
@@ -635,7 +690,8 @@ roleRef:
 	}
 
 	// Mint a time-bound K8s RBAC token for this ServiceAccount
-	tokenCmd := exec.CommandContext(quickCtx, "kubectl", "create", "token", saName, "-n", KeycloakNamespace, "--duration=24h")
+	tokArgs := append([]string{"create", "token", saName, "-n", KeycloakNamespace, "--duration=24h"}, adminArgs...)
+	tokenCmd := exec.CommandContext(quickCtx, "kubectl", tokArgs...)
 	tokenOut, err := tokenCmd.Output()
 	if err != nil {
 		return "", nil // Fallback gracefully if cluster doesn't support TokenRequest API

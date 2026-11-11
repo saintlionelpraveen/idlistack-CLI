@@ -2,16 +2,15 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/fatih/color"
 	"github.com/idlistack/cli/internal/auth"
 	"github.com/idlistack/cli/internal/config"
 	"github.com/idlistack/cli/internal/detect"
+	"github.com/idlistack/cli/internal/k8s"
 	"github.com/idlistack/cli/internal/ui"
 	"github.com/spf13/cobra"
 )
@@ -20,7 +19,7 @@ var initCmd = &cobra.Command{
 	Use:   "init",
 	Short: "Initialize a new IdliStack project in the current directory",
 	Long: `Initialize a new IdliStack project by creating an idlistack.toml config file
-and a .idlistack/ directory for internal state.
+and a .idlistack.json file for project state.
 
 This links the current directory to an IdliStack project and sets up the
 necessary configuration for detection, building, and deployment.`,
@@ -51,202 +50,139 @@ func runInit(cmd *cobra.Command, args []string) error {
 	}
 
 	// Check if already initialized
-	configPath := filepath.Join(cwd, "idlistack.toml")
-	if _, err := os.Stat(configPath); err == nil && !initForce {
-		ui.Warn("Project already initialized (idlistack.toml exists). Use --force to re-initialize.")
+	if cfg, err := config.Load(cwd); err == nil && !initForce {
+		ui.Warn(fmt.Sprintf("Project %s already initialized (.idlistack.json exists). Use --force to re-initialize.", color.CyanString(cfg.Project.Name)))
 		return nil
 	}
 
-	// Create .idlistack directory
-	idlistackDir := filepath.Join(cwd, ".idlistack")
-	if err := os.MkdirAll(idlistackDir, 0755); err != nil {
-		return fmt.Errorf("failed to create .idlistack directory: %w", err)
-	}
+	// Clean up any legacy directory & toml
+	_ = os.RemoveAll(filepath.Join(cwd, ".idlistack"))
+	_ = os.Remove(filepath.Join(cwd, "idlistack.toml"))
 
-	// Create link.json (internal state, gitignored)
-	linkData := config.LinkConfig{
+	// Dynamically determine target namespace from active kubecontext or fallback to project name
+	targetNS := k8s.ResolveNamespace(cmd.Context(), "", projectName)
+
+	// Create project state (.idlistack.json)
+	projectState := &config.ProjectState{
+		Version:     "1.0",
 		ProjectName: projectName,
 		ProjectDir:  cwd,
-	}
-	linkBytes, _ := json.MarshalIndent(linkData, "", "  ")
-	linkPath := filepath.Join(idlistackDir, "link.json")
-	if err := os.WriteFile(linkPath, linkBytes, 0600); err != nil {
-		return fmt.Errorf("failed to write link.json: %w", err)
+		Namespace:   targetNS,
+		Project: config.ProjectConfig{
+			Name: projectName,
+		},
+		Deploy: config.DeployConfig{
+			Namespace:       targetNS,
+			Replicas:        1,
+			HealthCheckPath: "/health",
+		},
 	}
 
 	// Attempt detection to auto-populate the config
 	ui.Info("Detecting application for initial configuration...")
 	plan, _ := detect.Detect(cmd.Context(), cwd, nil, false)
-
-	var buildSection, deploySection string
 	if plan != nil {
 		ui.Success(fmt.Sprintf("Detected %s application", color.CyanString(plan.Provider)))
-		buildSection = fmt.Sprintf(`[build]
-provider = "%s"`, plan.Provider)
-		
-		if plan.Runtime != "" {
-			buildSection += fmt.Sprintf("\nruntime = \"%s\"", plan.Runtime)
+		projectState.Plan = plan
+		projectState.Build = config.BuildConfig{
+			Provider:      plan.Provider,
+			Runtime:       plan.Runtime,
+			PreInstallCmd: plan.PreInstallCmd,
+			InstallCmd:    plan.InstallCmd,
+			BuildCmd:      plan.BuildCmd,
+			StartCmd:      plan.StartCmd,
 		}
-		if plan.PreInstallCmd != "" && len(plan.PreInstallCmd) < 80 {
-			buildSection += fmt.Sprintf("\npre_install_cmd = %q", plan.PreInstallCmd)
-		} else if plan.PreInstallCmd != "" {
-			buildSection += "\n# pre_install_cmd = \"\" # override provider default if needed"
-		}
-		if plan.InstallCmd != "" && len(plan.InstallCmd) < 80 {
-			buildSection += fmt.Sprintf("\ninstall_cmd = %q", plan.InstallCmd)
-		}
-		if plan.BuildCmd != "" {
-			buildSection += fmt.Sprintf("\nbuild_cmd = %q", plan.BuildCmd)
-		}
-		if plan.StartCmd != "" && !strings.HasPrefix(plan.StartCmd, "/") {
-			buildSection += fmt.Sprintf("\nstart_cmd = %q", plan.StartCmd)
-		}
-
-		deploySection = "[deploy]\n"
 		if plan.Port > 0 {
-			deploySection += fmt.Sprintf("port = %d\n", plan.Port)
-		} else {
-			deploySection += "# port = 0\n"
+			projectState.Deploy.Port = plan.Port
 		}
-		deploySection += "replicas = 1\nhealth_check_path = \"/health\""
-	} else {
-		ui.Warn("Could not automatically detect application, generating template config")
-		buildSection = `# [build]
-# provider = ""          # auto-detected if empty
-# build_cmd = ""         # override the detected build command
-# start_cmd = ""         # override the detected start command`
-		deploySection = `# [deploy]
-# port = 0               # auto-detected if empty
-# replicas = 1
-# health_check_path = "/health"`
+		if len(plan.Dependencies) > 0 {
+			projectState.Deploy.Dependencies = plan.Dependencies
+		}
 	}
 
-	// Create idlistack.toml
-	tomlContent := fmt.Sprintf(`# IdliStack Configuration
-# Documentation: https://idlistack.com/docs/config
-
-[project]
-name = "%s"
-
-%s
-
-%s
-
-# [env]
-# KEY = "value"
-`, projectName, buildSection, deploySection)
-
-	if err := os.WriteFile(configPath, []byte(tomlContent), 0644); err != nil {
-		return fmt.Errorf("failed to write idlistack.toml: %w", err)
-	}
-
-	// Create .idlistack/.gitignore
-	gitignoreContent := `# IdliStack internal state
-link.json
-buildplan.json
-*.lock
-`
-	gitignorePath := filepath.Join(idlistackDir, ".gitignore")
-	if err := os.WriteFile(gitignorePath, []byte(gitignoreContent), 0644); err != nil {
-		return fmt.Errorf("failed to write .gitignore: %w", err)
+	if err := config.SaveProjectState(cwd, projectState); err != nil {
+		return fmt.Errorf("failed to write %s: %w", config.ProjectStateFileName, err)
 	}
 
 	// Append to project .gitignore if it exists
 	projectGitignore := filepath.Join(cwd, ".gitignore")
 	if f, err := os.OpenFile(projectGitignore, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
 		defer f.Close()
-		f.WriteString("\n# IdliStack\n.idlistack/\n")
+		f.WriteString("\n# IdliStack\n.idlistack.json\n.idlistack/\nidlistack.toml\n")
 	}
 
-	targetNS := fmt.Sprintf("idlistack-%s", strings.ToLower(projectName))
-	if creds, err := auth.VerifyAndAuthorize(cmd.Context(), targetNS); err == nil && creds != nil {
-		ui.Detail("Bound namespace %s to Keycloak user %s (RBAC: %s)", color.CyanString(targetNS), color.CyanString(creds.Username), color.GreenString(creds.Scope))
+	if creds, _ := auth.LoadCredentials(); creds != nil && creds.User != "" {
+		ui.Detail("Configured for deployment to namespace %s (User: %s)", color.CyanString(targetNS), color.CyanString(creds.User))
 	}
 
 	ui.Success(fmt.Sprintf("Project %s initialized!", color.CyanString(projectName)))
 	fmt.Println()
 	ui.Info("Created:")
-	fmt.Printf("  %s  idlistack.toml (project config)\n", color.GreenString("→"))
-	fmt.Printf("  %s  .idlistack/    (internal state, gitignored)\n", color.GreenString("→"))
+	fmt.Printf("  %s  .idlistack.json  (project config & state, gitignored)\n", color.GreenString("→"))
 	fmt.Println()
 	ui.Info(fmt.Sprintf("Next: run %s to detect, build, and deploy", color.CyanString("idlistack up")))
 
 	return nil
 }
 
-// EnsureProjectInitialized checks if idlistack.toml exists. If missing, it auto-initializes the project.
+// EnsureProjectInitialized checks if .idlistack.json exists. If missing, it auto-initializes the project.
 func EnsureProjectInitialized(ctx context.Context, cwd string) (*config.Config, error) {
-	configPath := filepath.Join(cwd, "idlistack.toml")
-	if _, err := os.Stat(configPath); err == nil {
-		return config.Load(cwd)
+	if cfg, err := config.Load(cwd); err == nil {
+		return cfg, nil
 	}
 
 	projectName := filepath.Base(cwd)
 	ui.Info(fmt.Sprintf("Auto-initializing project %s (zero configuration)...", color.CyanString(projectName)))
 
-	idlistackDir := filepath.Join(cwd, ".idlistack")
-	if err := os.MkdirAll(idlistackDir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create .idlistack directory: %w", err)
-	}
+	// Clean up any legacy directory & toml
+	_ = os.RemoveAll(filepath.Join(cwd, ".idlistack"))
+	_ = os.Remove(filepath.Join(cwd, "idlistack.toml"))
 
-	linkData := config.LinkConfig{
+	targetNS := k8s.ResolveNamespace(ctx, "", projectName)
+
+	projectState := &config.ProjectState{
+		Version:     "1.0",
 		ProjectName: projectName,
 		ProjectDir:  cwd,
+		Namespace:   targetNS,
+		Project: config.ProjectConfig{
+			Name: projectName,
+		},
+		Deploy: config.DeployConfig{
+			Namespace:       targetNS,
+			Replicas:        1,
+			HealthCheckPath: "/health",
+		},
 	}
-	linkBytes, _ := json.MarshalIndent(linkData, "", "  ")
-	_ = os.WriteFile(filepath.Join(idlistackDir, "link.json"), linkBytes, 0600)
 
 	plan, _ := detect.Detect(ctx, cwd, nil, false)
-
-	var buildSection, deploySection string
 	if plan != nil {
-		buildSection = fmt.Sprintf("[build]\nprovider = %q", plan.Provider)
-		if plan.Runtime != "" {
-			buildSection += fmt.Sprintf("\nruntime = %q", plan.Runtime)
+		projectState.Plan = plan
+		projectState.Build = config.BuildConfig{
+			Provider:      plan.Provider,
+			Runtime:       plan.Runtime,
+			PreInstallCmd: plan.PreInstallCmd,
+			InstallCmd:    plan.InstallCmd,
+			BuildCmd:      plan.BuildCmd,
+			StartCmd:      plan.StartCmd,
 		}
-		if plan.PreInstallCmd != "" && len(plan.PreInstallCmd) < 80 {
-			buildSection += fmt.Sprintf("\npre_install_cmd = %q", plan.PreInstallCmd)
-		}
-		if plan.InstallCmd != "" && len(plan.InstallCmd) < 80 {
-			buildSection += fmt.Sprintf("\ninstall_cmd = %q", plan.InstallCmd)
-		}
-		if plan.BuildCmd != "" {
-			buildSection += fmt.Sprintf("\nbuild_cmd = %q", plan.BuildCmd)
-		}
-		if plan.StartCmd != "" && !strings.HasPrefix(plan.StartCmd, "/") {
-			buildSection += fmt.Sprintf("\nstart_cmd = %q", plan.StartCmd)
-		}
-
-		deploySection = "[deploy]\n"
 		if plan.Port > 0 {
-			deploySection += fmt.Sprintf("port = %d\n", plan.Port)
-		} else {
-			deploySection += "# port = 0\n"
+			projectState.Deploy.Port = plan.Port
 		}
-		deploySection += "replicas = 1\nhealth_check_path = \"/health\""
-	} else {
-		buildSection = "# [build]\n# provider = \"\""
-		deploySection = "# [deploy]\n# port = 0\nreplicas = 1"
+		if len(plan.Dependencies) > 0 {
+			projectState.Deploy.Dependencies = plan.Dependencies
+		}
+	}
+	if err := config.SaveProjectState(cwd, projectState); err != nil {
+		return nil, fmt.Errorf("failed to save project state: %w", err)
 	}
 
-	tomlContent := fmt.Sprintf(`# IdliStack Configuration
-# Documentation: https://idlistack.com/docs/config
-
-[project]
-name = %q
-
-%s
-
-%s
-`, projectName, buildSection, deploySection)
-
-	if err := os.WriteFile(configPath, []byte(tomlContent), 0644); err != nil {
-		return nil, fmt.Errorf("failed to write idlistack.toml: %w", err)
+	// Append to project .gitignore if it exists
+	if f, err := os.OpenFile(filepath.Join(cwd, ".gitignore"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+		defer f.Close()
+		f.WriteString("\n# IdliStack\n.idlistack.json\n.idlistack/\nidlistack.toml\n")
 	}
 
-	gitignoreContent := "# IdliStack internal state\nlink.json\nbuildplan.json\n*.lock\n"
-	_ = os.WriteFile(filepath.Join(idlistackDir, ".gitignore"), []byte(gitignoreContent), 0644)
-
-	ui.Success(fmt.Sprintf("✓ Initialized %s configuration", color.CyanString("idlistack.toml")))
-	return config.Load(cwd)
+	ui.Success(fmt.Sprintf("✓ Initialized %s configuration", color.CyanString(config.ProjectStateFileName)))
+	return projectState.ToConfig(), nil
 }

@@ -4,11 +4,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/fatih/color"
 	"github.com/idlistack/cli/internal/auth"
 	"github.com/idlistack/cli/internal/config"
+	"github.com/idlistack/cli/internal/k8s"
 	"github.com/idlistack/cli/internal/ui"
 	"github.com/spf13/cobra"
 )
@@ -33,42 +33,55 @@ Powered by Railpack for intelligent detection and BuildKit for optimized
 OCI image builds.`, color.New(color.FgHiCyan, color.Bold).Sprint("🚀 IdliStack")),
 	SilenceUsage:      true,
 	SilenceErrors:     true,
-	PersistentPreRunE: enforceKeycloakAuthMiddleware,
+	PersistentPreRunE: enforceFrappeAuthMiddleware,
 }
 
-// enforceKeycloakAuthMiddleware verifies that the user has a valid Keycloak OIDC token
-// and appropriate K3s RBAC permissions (cluster-wide or namespace-scoped) before running
+// enforceFrappeAuthMiddleware verifies that the user has a valid Frappe session
+// and active Teleport namespace-scoped RBAC permissions before running
 // init, up, down, status, logs, or env commands.
-func enforceKeycloakAuthMiddleware(cmd *cobra.Command, args []string) error {
+func enforceFrappeAuthMiddleware(cmd *cobra.Command, args []string) error {
+	// Proactively clean up and migrate any legacy .idlistack directory in workspace
+	cwd, _ := os.Getwd()
+	if cwd != "" {
+		_, _ = config.LoadProjectState(cwd)
+	}
+
 	name := cmd.Name()
-	// Exempt login, logout, whoami, auth setup/portal, version, admin, and help
+	// Exempt login, logout, whoami, auth, version, admin, init, and help
 	switch name {
-	case "idlistack", "login", "logout", "whoami", "auth", "setup", "portal", "admin", "version", "help":
+	case "idlistack", "login", "logout", "whoami", "auth", "admin", "version", "help", "init":
 		return nil
 	}
 	if cmd.Parent() != nil && cmd.Parent().Name() == "auth" {
 		return nil
 	}
 
+	// Exempt external kubeconfigs and remote clusters from local Frappe auth gate
+	if os.Getenv("KUBECONFIG") != "" || k8s.IsClusterRemote(cmd.Context()) {
+		return nil
+	}
+
 	// Determine target namespace for RBAC verification
-	cwd, _ := os.Getwd()
 	projectName := filepath.Base(cwd)
-	if cfg, err := config.Load(cwd); err == nil && cfg.Project.Name != "" {
-		projectName = cfg.Project.Name
+	targetNamespace := ""
+	if cfg, err := config.Load(cwd); err == nil {
+		if cfg.Project.Name != "" {
+			projectName = cfg.Project.Name
+		}
+		if cfg.Deploy.Namespace != "" {
+			targetNamespace = cfg.Deploy.Namespace
+		}
 	}
-	if name == "init" && initProjectName != "" {
-		projectName = initProjectName
-	}
-	targetNamespace := fmt.Sprintf("idlistack-%s", strings.ToLower(projectName))
+	targetNamespace = k8s.ResolveNamespace(cmd.Context(), targetNamespace, projectName)
 
 	creds, err := auth.VerifyAndAuthorize(cmd.Context(), targetNamespace)
 	if err != nil {
-		ui.Warn(fmt.Sprintf("Auth Gate: %v", err))
-		ui.Info("Launching authentication portal before executing command...")
+		ui.Warn(fmt.Sprintf("Frappe Auth Gate: %v", err))
+		ui.Info("Launching Frappe authentication portal before executing command...")
 		if loginErr := runLogin(cmd, args); loginErr != nil {
 			return fmt.Errorf("authentication required to run 'idlistack %s': %w", name, loginErr)
 		}
-		// Re-verify RBAC after login
+		// Re-verify after login
 		creds, err = auth.VerifyAndAuthorize(cmd.Context(), targetNamespace)
 		if err != nil {
 			return err
@@ -76,7 +89,7 @@ func enforceKeycloakAuthMiddleware(cmd *cobra.Command, args []string) error {
 	}
 
 	if Verbose && creds != nil {
-		ui.Detail("Authenticated via Keycloak as %s (RBAC: %s)", color.CyanString(creds.Username), color.GreenString(creds.Scope))
+		ui.Detail("Authenticated via Frappe as %s (Target Namespace: %s)", color.CyanString(creds.User), color.GreenString(targetNamespace))
 	}
 	return nil
 }

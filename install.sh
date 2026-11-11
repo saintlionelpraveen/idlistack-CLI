@@ -10,8 +10,10 @@
 #   4. kubectl CLI (configured with user kubeconfig permissions)
 #   5. Helm v3 (Atomic Kubernetes package manager)
 #   6. K3s containerd socket permissions (for zero-registry image sideloading)
-#   7. Railpack CLI (Automated buildpack detection engine)
-#   8. IdliStack CLI binary (installed to /usr/local/bin/idlistack)
+#   7. Teleport Client (tsh v16 Zero-Trust Kubernetes access)
+#   8. Railpack CLI (Automated buildpack detection engine)
+#   9. IdliStack CLI binary (installed to /usr/local/bin & ~/.local/bin)
+#  10. VS Code Extension (auto-installs bundled .vsix if 'code' is available)
 # ==============================================================================
 
 set -euo pipefail
@@ -171,7 +173,7 @@ EOF
 
 # --- Step 1: Install Core System Dependencies ---
 install_core_dependencies() {
-    log_step "Step 1/7: Installing core system utilities"
+    log_step "Step 1/8: Installing core system utilities"
     case "$OS_FAMILY" in
         debian)
             log_info "Updating package lists via apt-get..."
@@ -195,7 +197,7 @@ install_core_dependencies() {
 
 # --- Step 2: Install and Configure Docker Engine ---
 install_docker() {
-    log_step "Step 2/7: Installing & configuring Docker Engine"
+    log_step "Step 2/8: Installing & configuring Docker Engine"
 
     if command -v docker >/dev/null 2>&1; then
         log_info "Docker is already installed ($(docker --version))."
@@ -227,7 +229,7 @@ install_docker() {
 
 # --- Step 3: Install K3s Kubernetes Cluster (With Self-Healing) ---
 install_k3s() {
-    log_step "Step 3/7: Installing K3s (Lightweight Kubernetes)"
+    log_step "Step 3/8: Installing K3s (Lightweight Kubernetes)"
 
     # 1. Check if an active, healthy cluster is already running
     if (command -v kubectl >/dev/null 2>&1 && kubectl cluster-info >/dev/null 2>&1) || \
@@ -316,7 +318,7 @@ install_k3s() {
 
 # --- Step 4: Configure Kubectl & Kubeconfig ---
 configure_kubectl() {
-    log_step "Step 4/7: Configuring kubectl & developer kubeconfig"
+    log_step "Step 4/8: Configuring kubectl & developer kubeconfig"
 
     # Symlink kubectl to k3s if standalone kubectl is missing
     if ! command -v kubectl >/dev/null 2>&1; then
@@ -337,18 +339,20 @@ configure_kubectl() {
         run_as_root chmod 600 "${kube_dir}/config"
     fi
 
-    # Ensure KUBECONFIG environment variable is persisted in profile
-    local rc_file="${TARGET_HOME}/.bashrc"
-    if [ -f "$rc_file" ] && ! grep -q "KUBECONFIG" "$rc_file"; then
-        echo 'export KUBECONFIG=~/.kube/config' >> "$rc_file"
-    fi
+    # Ensure PATH includes ~/.local/bin and /usr/local/bin across shell profiles
+    # (Note: We avoid hardcoding KUBECONFIG so developers can freely switch contexts/cloud clusters)
+    for rc in "${TARGET_HOME}/.bashrc" "${TARGET_HOME}/.zshrc"; do
+        if [ -f "$rc" ] && ! grep -q ".local/bin" "$rc"; then
+            echo -e '\n# IdliStack CLI path\nexport PATH="$HOME/.local/bin:/usr/local/bin:$PATH"' >> "$rc"
+        fi
+    done
 
     log_success "kubectl configured and connected to cluster."
 }
 
 # --- Step 5: Configure K3s containerd Sideload Permissions ---
 configure_sideload_permissions() {
-    log_step "Step 5/7: Configuring K3s containerd zero-registry sideloading"
+    log_step "Step 5/8: Configuring K3s containerd zero-registry sideloading"
 
     # Make containerd socket accessible to non-root user
     if [ -S /run/k3s/containerd/containerd.sock ]; then
@@ -369,7 +373,7 @@ EOF
 
 # --- Step 6: Install Helm v3 ---
 install_helm() {
-    log_step "Step 6/7: Installing Helm v3 (Kubernetes Orchestrator)"
+    log_step "Step 6/8: Installing Helm v3 (Kubernetes Orchestrator)"
 
     if command -v helm >/dev/null 2>&1; then
         log_info "Helm v3 is already installed ($(helm version --short))."
@@ -381,9 +385,40 @@ install_helm() {
     log_success "Helm v3 is installed and ready."
 }
 
-# --- Step 7: Pre-fetch Railpack & IdliStack Binary ---
+# --- Step 7: Install Teleport Client (tsh v16 Zero-Trust Gateway) ---
+install_teleport() {
+    log_step "Step 7/8: Installing Teleport Client (tsh v16 Zero-Trust Gateway)"
+
+    if command -v tsh >/dev/null 2>&1; then
+        log_info "Teleport CLI is already installed ($(tsh version 2>&1 | head -n1))."
+        return 0
+    fi
+
+    log_info "Downloading Teleport v16.2.0 client (tsh)..."
+    local arch="amd64"
+    if [ "$(uname -m)" = "aarch64" ] || [ "$(uname -m)" = "arm64" ]; then
+        arch="arm64"
+    fi
+    local tp_url="https://cdn.teleport.dev/teleport-v16.2.0-linux-${arch}-bin.tar.gz"
+    if curl -fsSL "$tp_url" -o /tmp/teleport.tar.gz 2>/dev/null; then
+        tar -xzf /tmp/teleport.tar.gz -C /tmp teleport/tsh 2>/dev/null || true
+        if [ -f /tmp/teleport/tsh ]; then
+            run_as_root mv /tmp/teleport/tsh /usr/local/bin/tsh
+            run_as_root chmod 0755 /usr/local/bin/tsh
+            mkdir -p "${TARGET_HOME}/.local/bin"
+            ln -sf /usr/local/bin/tsh "${TARGET_HOME}/.local/bin/tsh" 2>/dev/null || true
+            run_as_root chown -R "${TARGET_USER}:${TARGET_USER}" "${TARGET_HOME}/.local/bin" 2>/dev/null || true
+            log_success "Teleport Client (tsh) installed to /usr/local/bin/tsh."
+        fi
+        rm -rf /tmp/teleport /tmp/teleport.tar.gz
+    else
+        log_warn "Could not pre-fetch Teleport client. Teleport features can be installed manually."
+    fi
+}
+
+# --- Step 8: Pre-fetch Railpack, Install IdliStack CLI & VS Code Extension ---
 install_railpack_and_cli() {
-    log_step "Step 7/7: Installing Railpack engine & IdliStack CLI binary"
+    log_step "Step 8/8: Installing Railpack engine, IdliStack CLI binary & VS Code extension"
 
     # 1. Pre-download Railpack to ~/.idlistack/bin/railpack
     local idli_bin_dir="${TARGET_HOME}/.idlistack/bin"
@@ -411,28 +446,57 @@ install_railpack_and_cli() {
         fi
     fi
 
-    # 2. Install IdliStack CLI binary to /usr/local/bin
+    # 2. Install IdliStack CLI binary to /usr/local/bin and ~/.local/bin
     local script_dir
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+    local user_local_bin="${TARGET_HOME}/.local/bin"
+    mkdir -p "${user_local_bin}"
+
     if [ -f "${script_dir}/bin/idlistack" ]; then
         log_info "Installing IdliStack CLI binary from local repo..."
         run_as_root cp "${script_dir}/bin/idlistack" /usr/local/bin/idlistack
         run_as_root chmod 0755 /usr/local/bin/idlistack
-        log_success "IdliStack CLI installed globally to /usr/local/bin/idlistack."
+        cp "${script_dir}/bin/idlistack" "${user_local_bin}/idlistack" 2>/dev/null || true
+        chmod 0755 "${user_local_bin}/idlistack" 2>/dev/null || true
+        log_success "IdliStack CLI installed to /usr/local/bin and ${user_local_bin}/idlistack."
     elif [ -f "${script_dir}/idlistack" ]; then
         log_info "Installing IdliStack CLI binary from local repo..."
         run_as_root cp "${script_dir}/idlistack" /usr/local/bin/idlistack
         run_as_root chmod 0755 /usr/local/bin/idlistack
-        log_success "IdliStack CLI installed globally to /usr/local/bin/idlistack."
+        cp "${script_dir}/idlistack" "${user_local_bin}/idlistack" 2>/dev/null || true
+        chmod 0755 "${user_local_bin}/idlistack" 2>/dev/null || true
+        log_success "IdliStack CLI installed to /usr/local/bin and ${user_local_bin}/idlistack."
     else
         log_info "Downloading compiled IdliStack CLI binary to /usr/local/bin/idlistack..."
         local idli_url="https://raw.githubusercontent.com/saintlionelpraveen/Idlistack-CLI/main/bin/idlistack"
         if curl -fsSL "$idli_url" -o /tmp/idlistack 2>/dev/null; then
             run_as_root mv /tmp/idlistack /usr/local/bin/idlistack
             run_as_root chmod 0755 /usr/local/bin/idlistack
+            cp /usr/local/bin/idlistack "${user_local_bin}/idlistack" 2>/dev/null || true
+            chmod 0755 "${user_local_bin}/idlistack" 2>/dev/null || true
             log_success "IdliStack CLI binary installed globally to /usr/local/bin/idlistack."
         else
             log_warn "Could not fetch standalone CLI binary. Note: The VS Code extension includes the CLI pre-bundled."
+        fi
+    fi
+    run_as_root chown -R "${TARGET_USER}:${TARGET_USER}" "${user_local_bin}" 2>/dev/null || true
+
+    # 3. Optional: Install VS Code Extension if 'code' command is present
+    if command -v code >/dev/null 2>&1; then
+        local vsix_file=""
+        for v in "${script_dir}/vscode-extension"/*.vsix "${script_dir}"/*.vsix; do
+            if [ -f "$v" ]; then
+                vsix_file="$v"
+            fi
+        done
+        if [ -n "$vsix_file" ]; then
+            log_info "Detected VS Code CLI. Installing IdliStack extension (${vsix_file##*/})..."
+            if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+                su - "$TARGET_USER" -c "code --install-extension '${vsix_file}' --force" >/dev/null 2>&1 || true
+            else
+                code --install-extension "${vsix_file}" --force >/dev/null 2>&1 || true
+            fi
+            log_success "IdliStack VS Code extension installed."
         fi
     fi
 }
@@ -479,6 +543,20 @@ verify_installation() {
         printf "  %-24s ${RED}✖ Missing${NC}\n" "Helm Orchestrator:"
     fi
 
+    # Teleport Check
+    if command -v tsh >/dev/null 2>&1; then
+        printf "  %-24s ${GREEN}✔ Installed${NC} (%s)\n" "Teleport Client (tsh):" "$(tsh version 2>&1 | head -n1 | cut -d' ' -f2)"
+    else
+        printf "  %-24s ${YELLOW}⚠ Optional${NC}\n" "Teleport Client (tsh):"
+    fi
+
+    # Railpack Check
+    if command -v railpack >/dev/null 2>&1 || [ -f "${TARGET_HOME}/.idlistack/bin/railpack" ]; then
+        printf "  %-24s ${GREEN}✔ Cached & Ready${NC}\n" "Railpack Engine:"
+    else
+        printf "  %-24s ${YELLOW}⚠ Auto-downloads on up${NC}\n" "Railpack Engine:"
+    fi
+
     # IdliStack CLI Check
     if command -v idlistack >/dev/null 2>&1; then
         printf "  %-24s ${GREEN}✔ Installed${NC} (/usr/local/bin/idlistack)\n" "IdliStack CLI:"
@@ -493,9 +571,13 @@ verify_installation() {
     echo "Next Steps:"
     echo "  1. If running under a new shell session, apply group changes:"
     echo "     ${CYAN}newgrp docker${NC}  (or log out and log back in)"
-    echo "  2. Open your project in Visual Studio Code."
-    echo "  3. Press ${BOLD}Ctrl+Shift+P${NC} (or Cmd+Shift+P) and run:"
-    echo "     ${CYAN}IdliStack: Deploy to K3s (Up)${NC}"
+    echo "  2. Authenticate with Frappe Auth Portal & Teleport RBAC:"
+    echo "     ${CYAN}idlistack login${NC}"
+    echo "  3. Check active user session & allowed namespaces:"
+    echo "     ${CYAN}idlistack whoami${NC}"
+    echo "  4. Deploy your application to K3s:"
+    echo "     ${CYAN}idlistack up${NC}"
+    echo "  5. Or use the VS Code Command Palette: ${BOLD}Ctrl+Shift+P${NC} -> ${CYAN}IdliStack: Deploy to K3s (Up)${NC}"
     echo
 }
 
@@ -518,6 +600,7 @@ main() {
     configure_kubectl
     configure_sideload_permissions
     install_helm
+    install_teleport
     install_railpack_and_cli
     verify_installation
 }

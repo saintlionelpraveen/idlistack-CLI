@@ -246,14 +246,21 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		PVCs:            []PVCInfo{},
 	}
 
-	// 1. Try reading buildplan.json
-	buildPlanPath := filepath.Join(s.projectDir, ".idlistack", "buildplan.json")
-	if data, err := os.ReadFile(buildPlanPath); err == nil {
-		var plan buildplan.Plan
-		if err := json.Unmarshal(data, &plan); err == nil {
-			resp.BuildPlan = &plan
-			if resp.Port == 0 {
-				resp.Port = plan.Port
+	// 1. Try reading .idlistack.json (or fallback to legacy buildplan.json)
+	if state, err := config.LoadProjectState(s.projectDir); err == nil && state.Plan != nil {
+		resp.BuildPlan = state.Plan
+		if resp.Port == 0 {
+			resp.Port = state.Plan.Port
+		}
+	} else {
+		buildPlanPath := filepath.Join(s.projectDir, ".idlistack", "buildplan.json")
+		if data, err := os.ReadFile(buildPlanPath); err == nil {
+			var plan buildplan.Plan
+			if err := json.Unmarshal(data, &plan); err == nil {
+				resp.BuildPlan = &plan
+				if resp.Port == 0 {
+					resp.Port = plan.Port
+				}
 			}
 		}
 	}
@@ -787,13 +794,21 @@ func (s *Server) handleEnv(w http.ResponseWriter, r *http.Request) {
 					envMap[k] = v
 				}
 			}
-			buildPlanPath := filepath.Join(s.projectDir, ".idlistack", "buildplan.json")
-			if data, err := os.ReadFile(buildPlanPath); err == nil {
-				var plan buildplan.Plan
-				if err := json.Unmarshal(data, &plan); err == nil && plan.Env != nil {
-					for k, v := range plan.Env {
-						if _, exists := envMap[k]; !exists {
-							envMap[k] = v
+			if state, err := config.LoadProjectState(s.projectDir); err == nil && state.Plan != nil && state.Plan.Env != nil {
+				for k, v := range state.Plan.Env {
+					if _, exists := envMap[k]; !exists {
+						envMap[k] = v
+					}
+				}
+			} else {
+				buildPlanPath := filepath.Join(s.projectDir, ".idlistack", "buildplan.json")
+				if data, err := os.ReadFile(buildPlanPath); err == nil {
+					var plan buildplan.Plan
+					if err := json.Unmarshal(data, &plan); err == nil && plan.Env != nil {
+						for k, v := range plan.Env {
+							if _, exists := envMap[k]; !exists {
+								envMap[k] = v
+							}
 						}
 					}
 				}

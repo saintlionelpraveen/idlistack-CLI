@@ -147,9 +147,9 @@ func RenderAdminHTML(nodeHost string, port int) string {
         <div class="stat-sub">Local K3s Cluster</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">Keycloak Tenants <span>👥</span></div>
+        <div class="stat-label">Frappe Tenants <span>👥</span></div>
         <div class="stat-value" id="statUsers">-</div>
-        <div class="stat-sub">Namespace-scoped IAM</div>
+        <div class="stat-sub">Teleport RBAC Scoped</div>
       </div>
     </div>
 
@@ -217,8 +217,8 @@ func RenderAdminHTML(nodeHost string, port int) string {
     <!-- Tab 3: Users & Tenants -->
     <div id="tab-users" class="panel" style="display: none;">
       <div class="panel-header">
-        <div class="panel-title">Keycloak Identity & Developer Tenants</div>
-        <a id="kcAdminLink" href="http://%s:30080/admin" target="_blank" class="url-link">↗ Open Keycloak Master Admin</a>
+        <div class="panel-title">Frappe Identity & Developer Tenants</div>
+        <a id="kcAdminLink" href="http://%s:8000/app/user" target="_blank" class="url-link">↗ Open Frappe Desk</a>
       </div>
       <table>
         <thead>

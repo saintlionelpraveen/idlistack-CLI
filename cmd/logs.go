@@ -3,11 +3,11 @@ package cmd
 import (
 	"fmt"
 	"os"
-	"strings"
 
 	"github.com/fatih/color"
 	"github.com/idlistack/cli/internal/auth"
 	"github.com/idlistack/cli/internal/config"
+	"github.com/idlistack/cli/internal/k8s"
 	"github.com/idlistack/cli/internal/ui"
 	"github.com/spf13/cobra"
 )
@@ -44,8 +44,11 @@ func runLogs(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	deploymentName := strings.ToLower(cfg.Project.Name)
-	namespace := fmt.Sprintf("idlistack-%s", deploymentName)
+	namespace := k8s.ResolveNamespace(cmd.Context(), cfg.Deploy.Namespace, cfg.Project.Name)
+	deploymentName := k8s.CleanAppName(cfg.Project.Name)
+	if deploymentName == "" || deploymentName == "app" {
+		deploymentName = k8s.CleanAppName(namespace)
+	}
 
 	ui.Info(fmt.Sprintf("Streaming logs for %s ...", color.CyanString(deploymentName)))
 	fmt.Println()

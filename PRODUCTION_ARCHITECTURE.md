@@ -1,58 +1,118 @@
 # IdliStack CLI — Production Architecture & Technical Reference
 
-> **Deploy any application with zero configuration.**
-> Designed for local environments and production edge clusters. Powered by Go, Railpack (BuildKit), Docker, Helm, and K3s.
+> **Deploy any application with zero configuration and zero-trust RBAC.**
+> Designed for local environments and edge Kubernetes clusters. Powered by Go, Frappe Auth Control Plane, Teleport M2M, Railpack (BuildKit), Docker, Helm v3, and K3s.
 
 ---
 
 ## 1. Executive Summary & Design Philosophy
 
-IdliStack is a production-grade deployment orchestrator that abstracts the complexities of containerization and Kubernetes. It acts as an intelligent, invisible pipeline that automatically **detects** an application's stack, **compiles** an optimized OCI-compliant image via **Railpack** (BuildKit), and **deploys** it to a lightweight **K3s** cluster using native **Helm** charts with persistent storage and companion database sidecars.
+IdliStack is a production-grade deployment orchestrator that abstracts the complexities of containerization, Kubernetes networking, and cluster security. It provides an invisible, highly resilient pipeline that automatically **authenticates** developers through a centralized **Frappe Auth Control Plane**, **mints ephemeral zero-trust Kubernetes credentials** via **Teleport Machine-to-Machine (M2M)**, **detects** an application's technology stack, **compiles** an optimized OCI-compliant image via **Railpack** (BuildKit), and **deploys** it to a lightweight **K3s** cluster using native **Helm** charts with persistent storage and companion database sidecars.
 
 ### Core Tenets
-- **Zero Configuration:** Developers never need to write `Dockerfiles`, Kubernetes YAMLs, or CI/CD pipelines to achieve a production-ready deployment.
+- **Zero Configuration:** Developers never need to write `Dockerfiles`, Kubernetes YAML manifests, or CI/CD pipelines to achieve a production-grade deployment.
+- **Zero-Trust Access Control:** Developers never receive cluster-admin or permanent kubeconfigs. Every deployment mints a short-lived (15-minute), namespace-restricted X.509 client certificate scoped strictly to their application (`idlistack-<app>`).
 - **Dynamic Adaptability:** Hardcoded versions are anti-patterns. IdliStack dynamically infers runtimes from source code (e.g., `package.json`, `go.mod`, `.python-version`, `Cargo.toml`).
-- **Production-Grade Tooling:** IdliStack utilizes **K3s** (a CNCF-certified lightweight Kubernetes distribution), **Railpack** (Railway's modern BuildKit compiler), and **Helm** (atomic releases, rollbacks, and lifecycle hooks) to ensure exact parity with real-world cloud environments.
 - **Zero-Install Client Resilience:** End users do not need to pre-install Railpack. IdliStack's standalone resolver automatically fetches the binary transparently into `~/.idlistack/bin/railpack`, with a built-in multi-stage Dockerfile generator as an offline safety net.
+- **Production-Grade Tooling:** IdliStack utilizes CNCF-certified tools (**K3s**, **Helm v3**, **BuildKit**, **Teleport**) to ensure 100% parity with cloud production environments.
 
 ---
 
-## 2. Technology Stack
+## 2. Technology Stack & Subsystems
 
 | Component | Technology | Role & Purpose |
 | :--- | :--- | :--- |
-| **CLI Framework** | [Cobra](https://github.com/spf13/cobra) (Go) | Command parsing, subcommands (`up`, `down`, `status`, `env`, `init`), flags, and contextual help. |
-| **Configuration** | TOML | Parses `idlistack.toml` for optional project-specific overrides. |
+| **CLI Framework** | [Cobra](https://github.com/spf13/cobra) (Go) | Command parsing, flags, subcommands (`up`, `down`, `status`, `admin`, `login`, `whoami`, `env`, `init`). |
+| **Auth Control Plane** | [Frappe Framework](https://frappeframework.com) | User directory, tenant ownership, role assignment, audit logging, and Teleport delegation (`idli_cli` app on port 8000). |
+| **Zero-Trust Gateway** | [Teleport v16](https://goteleport.com) (Auth & Proxy) | Issues cryptographic, short-lived X.509 certificates and enforces Kubernetes RBAC (`idlistack-cluster`). |
+| **Machine-to-Machine Bot** | Teleport `tbot` / `tctl` | Dedicated bot identity (`bot-frappe-deployer`) enabling Frappe to safely mint credentials without exposing root CA keys. |
 | **Primary Build Engine** | [Railpack](https://railpack.com) (v0.39+) | Modern BuildKit-based planner & OCI image compiler by Railway. |
 | **Detection Engine** | Railpack + Dynamic Rules | Stack, runtime version, and start command inference with heuristic fallback. |
 | **Image Builder** | Docker Engine & BuildKit | Compiles inferred architectures into OCI-compliant images with multi-tier caching. |
 | **Cluster Runtime** | K3s (containerd) | Lightweight, single-binary Kubernetes distribution with direct image sideloading. |
-| **Orchestrator** | Helm v3 | Scaffolds and manages Kubernetes resources atomically (deployments, rollbacks, hooks). |
-| **Management Console** | Embedded HTTP & SSE | Embedded Go web server providing real-time metrics, live log streaming, web shell, and backups. |
+| **Orchestrator** | Helm v3 | Scaffolds and manages Kubernetes resources atomically (deployments, rollbacks, lifecycle hooks). |
+| **Developer Console** | Embedded HTTP & SSE | Embedded Go web server providing real-time metrics, live log streaming, container shell, and backups (port 4200). |
+| **Admin Console** | Embedded Go HTTP Server | Cluster-wide resource allocation, multi-tenant namespace overview, and IAM status (port 4202). |
 
 ---
 
-## 3. The 6-Stage Deployment Pipeline
+## 3. High-Level Architectural Diagram
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                               DEVELOPER WORKSPACE                                │
+│   ┌───────────────────────────┐           ┌──────────────────────────────────┐   │
+│   │     IdliStack CLI         │           │   VS Code Extension (v1.14.0)    │   │
+│   │  (idlistack up, status)   │           │   (Status bar, 1-Click Deploy)   │   │
+│   └─────────────┬─────────────┘           └────────────────┬─────────────────┘   │
+└─────────────────┼──────────────────────────────────────────┼─────────────────────┘
+                  │                                          │
+                  │ 1. Browser Login (`http://localhost:8000/cli_login`)
+                  ▼                                          ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                      FRAPPE CONTROL PLANE (`idli_cli` on port 8000)              │
+│  - User Directory & Team RBAC (e.g., son@gmail.com)                              │
+│  - Multi-tenant Namespace Registry (`idlistack-<app>`)                           │
+│  - Deployment Audit Trail & Status History                                       │
+└─────────────────────────┬────────────────────────────────────────────────────────┘
+                          │
+                          │ 2. Request Ephemeral Scoped Kubeconfig
+                          │    via Machine-to-Machine Identity (`bot-frappe-deployer`)
+                          ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                      TELEPORT ZERO-TRUST GATEWAY (v16.2.0)                       │
+│  - Auth Service (port 3025) & Web Proxy (port 3080)                              │
+│  - Signs temporary X.509 client certificate (15-minute TTL)                      │
+│  - Enforces Kubernetes RBAC Role: idlistack-developer                            │
+│  - Restricts access strictly to target namespace: idlistack-<app>                │
+└─────────────────────────┬────────────────────────────────────────────────────────┘
+                          │
+                          │ 3. Ephemeral Kubeconfig returned to CLI (mode 0600)
+                          │    Active KUBECONFIG exported, memory shredding on exit
+                          ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                                 K3S LOCAL CLUSTER                                │
+│  - Kube-API Server (https://127.0.0.1:6443)                                      │
+│  - Sideloaded containerd image cache (`k3s ctr images import`)                   │
+│  - Namespace: `idlistack-<app>`                                                  │
+│    ├── Pod: Application (Port: 3000 -> NodePort: 30000-32767)                   │
+│    ├── Pod: Companion Database (PostgreSQL 15 / MariaDB 10.6 / Redis 7)          │
+│    ├── Service: NodePort deterministic router                                    │
+│    └── PVC: Persistent local storage                                             │
+└──────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 4. The 6-Stage Deployment Pipeline
 
 Every execution of `idlistack up` runs through a deterministic 6-stage lifecycle:
 
 ```
-┌────────────────────────────────────────────────────────────────────────┐
-│                              idlistack up                              │
-├────────────┬────────────┬────────────┬────────────┬────────────┬───────┤
-│  Stage 1   │  Stage 2   │  Stage 3   │  Stage 4   │  Stage 5   │Stage 6│
-│  Validate  │   Detect   │ Save Build │ Build OCI  │  Sideload  │ Helm  │
-│  Project   │ Application│   Plan     │ via Railpack│  to K3s   │Deploy │
-└────────────┴────────────┴────────────┴────────────┴────────────┴───────┘
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│                                    idlistack up                                    │
+├──────────────┬──────────────┬──────────────┬──────────────┬──────────────┬─────────┤
+│   Stage 1    │   Stage 2    │   Stage 3    │   Stage 4    │   Stage 5    │ Stage 6 │
+│   Validate   │    Detect    │  Save Build  │  Build OCI   │   Sideload   │  Helm   │
+│ & Authorize  │ Application  │    Plan      │ via Railpack │    to K3s    │ Deploy  │
+└──────────────┴──────────────┴──────────────┴──────────────┴──────────────┴─────────┘
 ```
 
-### 3.1. Stage 1: Workspace Validation & Sizing
-- **Config Verification:** Loads `idlistack.toml`. If missing, prompts the user to initialize via `idlistack init` (or generates a preview config when run with `--inspect`).
-- **Ignore Engine:** Recursively scans the directory using `.idlistackignore` (and `.gitignore` as fallback). Excludes heavy artifacts (`node_modules`, `.git`, `__pycache__`, `.venv`, `target`, `dist`).
-- **Dynamic Size Ceiling:** Enforces `currentSize + 50MB` buffer to protect system resources.
+### 4.1. Stage 1: Workspace Validation & Zero-Trust Teleport Authorization
+1. **Config Verification:** Loads `idlistack.toml`. If absent, auto-generates a minimal configuration or prompts via `idlistack init`.
+2. **Ignore Engine:** Recursively scans the directory using `.idlistackignore` (and `.gitignore` as fallback). Excludes heavy artifacts (`node_modules`, `.git`, `__pycache__`, `.venv`, `target`, `dist`).
+3. **Dynamic Size Ceiling:** Enforces `currentSize + 50MB` safety buffer to prevent accidental disk saturation.
+4. **Frappe Session Validation:** Reads `~/.idlistack/credentials.json`. Verifies the developer's session token against Frappe (`/api/method/idli_cli.api.auth.verify_session`).
+5. **Namespace Claiming & Authorization:**
+   - The CLI requests an ephemeral Kubeconfig for namespace `idlistack-<app>` via `/api/method/idli_cli.api.deploy.request_kubeconfig`.
+   - Frappe checks if the namespace is owned by the developer. If unassigned or seeded by `Administrator`, Frappe automatically assigns ownership to the developer.
+6. **Teleport M2M Kubeconfig Minting:**
+   - Frappe uses the Teleport bot identity (`bot-frappe-deployer`) to request a short-lived (900 seconds / 15 minutes) certificate scoped exclusively to the target namespace.
+   - CLI writes the decoded kubeconfig to `/tmp/idlistack-kube/kc-<app>-<random>.yaml` with permissions `0600`.
+   - CLI sets `os.Setenv("KUBECONFIG", path)` and registers an exit handler that zero-fills the file before deletion.
 
-### 3.2. Stage 2: Multi-Layer Detection Engine
-The detection hierarchy identifies the stack, runtime version, and start commands:
+### 4.2. Stage 2: Multi-Layer Detection Engine
+The detection engine inspects the codebase using a deterministic priority hierarchy:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -67,65 +127,156 @@ The detection hierarchy identifies the stack, runtime version, and start command
 ```
 
 - **Transparent Railpack Resolution:** Uses `ResolveRailpackBinary()`. If `railpack` is not in the system `PATH`, it checks `~/.idlistack/bin/railpack` or automatically downloads the standalone static binary for the host OS and architecture.
-- **Port Detection:** Inspects `.env`, `config.toml`, or defaults based on stack conventions (Node: 3000, Python: 8000, Go: 8080).
+- **Runtime Inference:** Reads version files (e.g., `.nvmrc`, `package.json -> engines.node`, `go.mod`, `.python-version`, `Cargo.toml`).
+- **Port Detection:** Inspects environment files, framework config, or defaults to stack conventions (Node: 3000, Python: 8000, Go: 8080).
 
-### 3.3. Stage 3: Build Plan Serialization
-- Serializes the normalized build plan into `.idlistack/buildplan.json`.
+### 4.3. Stage 3: Project State & Build Plan Serialization
+- Serializes the normalized build plan and project state into a single **`.idlistack.json`** file in the project root.
+- Eliminates nested folder clutter in developer repositories while maintaining 100% deterministic reproducibility.
 - When invoked as `idlistack up --inspect`, outputs formatted JSON and confidence ratings without triggering a build or deployment.
 
-### 3.4. Stage 4: OCI Image Compilation
+### 4.4. Stage 4: OCI Image Compilation
 - **Tag Generation:** Generates a deterministic tag: `idlistack/<project-name>:<unix-timestamp>`.
 - **Railpack Compilation:** Triggers `railpack build . --name <imageTag>` utilizing Docker BuildKit caching mounts.
-- **Native Fallback:** If Railpack is unavailable, generates an optimized multi-stage Dockerfile (`.idlistack/Dockerfile.generated`) and builds directly via `docker build`.
+- **Native Fallback:** If Railpack is unavailable, generates an optimized multi-stage Dockerfile in a secure temporary file and builds directly via `docker build`, cleaning up the file upon completion.
 
-### 3.5. Stage 5: Cluster Detection & Image Sideloading
+### 4.5. Stage 5: Cluster Detection & Image Sideloading
 To bypass the latency, network cost, and credential management of public Docker registries, IdliStack injects images directly into the local cluster:
-- **Cluster Discovery:** Detects K3s, Minikube, Kind, or Docker Desktop via `kubectl config current-context` and node metadata.
-- **K3s containerd Import:** Exports the image to `/tmp/idlistack-<time>.tar` and imports via `k3s ctr images import`.
-- **Sidecar Pre-loading:** Pulls and sideloads dependency images (`postgres:15-alpine`, `mariadb:10.6`, `redis:7-alpine`, `busybox:1.36`).
+- **Cluster Discovery:** Detects K3s via `kubectl config current-context` (or active Teleport kubeconfig) and node metadata.
+- **K3s containerd Import:** Exports the image to `/tmp/idlistack-<time>.tar` and imports directly via `k3s ctr images import`.
+- **Sidecar Pre-loading:** Pulls and sideloads companion dependency images (`postgres:15-alpine`, `mariadb:10.6`, `redis:7-alpine`, `busybox:1.36`).
 
-### 3.6. Stage 6: Helm Orchestration & Rollout
-- **Concurrency Locking:** Acquires `/tmp/idlistack-<app>.lock` via `syscall.Flock`.
-- **Chart Generation:** Writes dynamic manifests to `.idlistack/helm/templates/`.
+### 4.6. Stage 6: Helm Orchestration & Rollout
+- **Concurrency Locking:** Acquires `/tmp/idlistack-<app>.lock` via `syscall.Flock` to prevent simultaneous conflicting deployments.
+- **Transient Chart Generation:** Generates atomic Helm manifests into a transient `/tmp/idlistack-helm-<app>-*` directory.
 - **Zombie Release Purging:** Identifies and cleans releases stuck in `pending-install`, `pending-upgrade`, or `failed`.
-- **Atomic Deployment:** Runs:
+- **Atomic Deployment:** Executes:
   ```bash
-  helm upgrade --install <app> .idlistack/helm --namespace idlistack-<app> --create-namespace --wait --timeout 300s --atomic
+  helm upgrade --install <app> <transientHelmDir> --namespace idlistack-<app> --create-namespace --wait --timeout 300s --atomic
   ```
-- **Crash Diagnostic & Rollback:** If the pod fails readiness probes, IdliStack dumps the last 30 lines of container logs and warning events before executing an atomic rollback.
+- **Automatic Cleanup:** Removes transient chart artifacts immediately on rollout completion.
+- **TCP Socket Health Probes:** Applies a **150-second startup grace window** (30 attempts × 5s) to allow migrations or heavy frameworks to boot cleanly.
+- **Audit Logging:** Reports deployment outcome, image tag, and live URL back to Frappe via `/api/method/idli_cli.api.deploy.record_deployment`.
 
 ---
 
-## 4. Subsystems & Key Workflows
+## 5. Security Architecture: Teleport M2M & Zero-Trust RBAC
 
-### 4.1. Automated Companion Dependencies (Databases & Caches)
-IdliStack automatically inspects environment variables and configuration files for database connection strings:
-- **PostgreSQL 15:** Injects `Deployment`, `Service`, and persistent 5Gi `PersistentVolumeClaim`.
-- **MariaDB 10.6 / MySQL:** Provisions service and automatically mounts any project `database.sql` into `/docker-entrypoint-initdb.d/init.sql` via a Kubernetes `ConfigMap`.
-- **Redis 7:** Provisions cache deployment and service.
+### 5.1. The Threat Model
+In multi-developer environments or local shared workstations, giving developers unrestricted `cluster-admin` access creates serious risks:
+- Developers can accidentally delete or tamper with system namespaces (`kube-system`, `teleport`).
+- Developers can view secrets belonging to other projects.
+- Credentials stored on disk can be leaked or stolen.
 
-### 4.2. Traffic Routing & Deterministic NodePorts
-- Queries cluster-wide allocated NodePorts to prevent port collisions.
-- Computes a deterministic port in `30000–32767` using FNV-1a hashing on the project name.
-- Resolves the host Node IP to present the user with a clickable, routable URL (`http://<node-ip>:<node-port>`).
+### 5.2. Teleport Machine-to-Machine (M2M) Solution
+IdliStack solves this using Teleport's Machine-to-Machine bot architecture:
 
-### 4.3. Robust Health Probes & File Permissions
-- Employs **TCP Socket Probes** (`startupProbe`, `livenessProbe`, `readinessProbe`) instead of fragile HTTP endpoints.
-- Allocates a **150-second startup window** (30 attempts × 5s) to allow slow frameworks or database migrations to complete before liveness probes kick in.
-- Injects a `busybox:1.36` `initContainer` to enforce volume ownership (`chmod -R 777` / `chown -R 1000:1000`) for non-root containers.
-
-### 4.4. Interactive Web Dashboard (`idlistack status`)
-Running `idlistack status` starts an embedded Go HTTP/SSE server (default port `4200`) providing:
-- Real-time CPU and Memory monitoring.
-- Interactive Environment Variable & Secret CRUD editor.
-- In-browser interactive container terminal shell.
-- 1-click on-demand SQL database backup streaming.
-- Deployment revision history and 1-click instant Helm rollbacks.
-- Live log streaming and replica scaling controls.
+1. **Bot Provisioning:** Teleport runs a dedicated service identity `bot-frappe-deployer` with the `idlistack-bot` role.
+2. **Ephemeral Minting:** When Frappe receives an authorized deployment request, it asks Teleport to mint an X.509 certificate with:
+   - **TTL:** 15 minutes (900 seconds).
+   - **Allowed Kubernetes Groups:** `idlistack:developer`.
+   - **Allowed Kubernetes Namespaces:** Only `idlistack-<app>`.
+3. **No Long-Lived Cluster Secrets:** Developers never possess a cluster CA certificate or admin token. If a laptop is left unattended or a temporary file is inspected later, the token has already expired.
+4. **Memory & Disk Sanitization:** The CLI registers process signal handlers (`SIGINT`, `SIGTERM`, normal exit). When the CLI finishes or is cancelled, it overwrites the ephemeral file with zeroes before unlinking it.
 
 ---
 
-## 5. Directory Structure & Code Organization
+## 6. End-to-End Real-World Lifecycle Walkthrough
+
+Here is a step-by-step example showing exactly what happens under the hood when a developer builds and deploys an application from scratch.
+
+### Step 1: Initial Setup & Workspace Creation
+A developer creates a new Node.js project:
+```bash
+mkdir my-api && cd my-api
+npm init -y
+npm install express
+cat << 'EOF' > server.js
+const express = require('express');
+const app = express();
+const port = process.env.PORT || 3000;
+app.get('/', (req, res) => res.json({ status: 'ok', message: 'Hello from IdliStack!' }));
+app.listen(port, () => console.log(`Server listening on port ${port}`));
+EOF
+```
+
+### Step 2: Developer Authentication (`idlistack login`)
+The developer logs in:
+```bash
+idlistack login
+```
+1. CLI starts a temporary HTTP server on `http://127.0.0.1:4201/callback`.
+2. Automatically opens the developer's default browser to `http://localhost:8000/cli_login`.
+3. Developer logs in with their team account (`son@gmail.com`).
+4. Frappe verifies the user, generates a secure CLI token, and redirects back to `http://127.0.0.1:4201/callback?token=...`.
+5. CLI saves the session to `~/.idlistack/credentials.json`.
+
+### Step 3: Verifying Session Scope (`idlistack whoami`)
+```bash
+idlistack whoami
+```
+Outputs:
+```text
+  Authenticated as: son@gmail.com
+  Frappe Control Plane: http://localhost:8000
+  Teleport RBAC Scope: Namespace-Restricted
+  Authorized Namespaces: idlistack-my-api
+```
+
+### Step 4: Zero-Config Deployment (`idlistack up`)
+The developer deploys with one command:
+```bash
+idlistack up
+```
+
+**Lifecycle execution:**
+1. **Validation:** Identifies workspace directory `my-api`. Filters out `node_modules` (1.2 MB transferred, ceiling set to 51.2 MB).
+2. **Teleport Scoping:** Sends request to Frappe. Frappe issues an ephemeral Kubeconfig for namespace `idlistack-my-api`.
+3. **Detection:** Railpack scans `package.json`, detects `node (v24.21.0)`, detects start script `node server.js`, detects port `3000`.
+4. **Build:** Railpack invokes Docker BuildKit. Layers are compiled and tagged `idlistack/my-api:1728892100`.
+5. **Sideload:** CLI saves tar stream directly into K3s containerd namespace `k8s.io`.
+6. **Helm Rollout:**
+   - Evaluates deterministic NodePort: `32249`.
+   - Generates transient Helm chart in `/tmp/idlistack-helm-my-api-*`.
+   - Executes atomic upgrade: `helm upgrade --install my-api <transientHelmDir> -n idlistack-my-api --atomic`.
+   - Automatically cleans up transient chart files, persisting state to `.idlistack.json`.
+   - Waits for TCP socket probe on port 3000 to become healthy.
+7. **Success Output:**
+   ```text
+   ✓ Application deployed successfully!
+     URL: http://127.0.0.1:32249
+     Namespace: idlistack-my-api
+   ```
+
+### Step 5: Live Monitoring & Management (`idlistack status`)
+```bash
+idlistack status
+```
+- Launches the embedded Go web server on `http://127.0.0.1:4200`.
+- Browser displays:
+  - Real-time CPU and Memory usage graphs.
+  - Interactive terminal shell inside the running container.
+  - Secret & environment variable editor with zero-downtime rolling restart.
+  - 1-click database SQL backups.
+  - Helm revision history with 1-click rollback.
+
+### Step 6: Cluster Administration (`idlistack admin`)
+```bash
+idlistack admin
+```
+- Launches the cluster admin console on `http://127.0.0.1:4202`.
+- Displays aggregate CPU/RAM allocation, active tenant namespaces, and live pod counts.
+
+### Step 7: Teardown (`idlistack down`)
+```bash
+idlistack down
+```
+- Uninstalls Helm release `my-api`.
+- Cleans up persistent storage and deletes namespace `idlistack-my-api`.
+
+---
+
+## 7. Directory Structure & Code Organization
 
 ```text
 CLI/
@@ -135,51 +286,85 @@ CLI/
 ├── README.md                        # Primary user documentation
 ├── cmd/                             # Cobra command implementations
 │   ├── root.go                      # Global flags and root command context
+│   ├── auth.go                      # idlistack login, logout, whoami
+│   ├── admin.go                     # idlistack admin console (port 4202)
 │   ├── init.go                      # Project initialization
 │   ├── up.go                        # The 6-stage deployment pipeline orchestrator
 │   ├── down.go                      # Helm uninstall and namespace teardown
 │   ├── logs.go                      # Real-time streaming log aggregator
-│   ├── status.go                    # Terminal health check & web dashboard launcher
+│   ├── status.go                    # Terminal health check & web dashboard launcher (port 4200)
 │   └── env.go                       # Kubernetes Secret management
 ├── internal/                        # Core internal engine logic
-│   ├── app/                         # Fast in-memory filesystem scanner
+│   ├── admin/                       # Multi-tenant admin server & HTML assets
+│   ├── app/                         # Fast in-memory filesystem scanner & ignore rules
+│   ├── auth/                        # Frappe API client & Teleport ephemeral kubeconfig generator
+│   │   └── frappe.go                # Browser login, token management, and cleanup handlers
 │   ├── buildplan/                   # Standardized build plan schema
 │   ├── config/                      # TOML configuration parser
-│   ├── dashboard/                   # Embedded Web Dashboard server & static assets
+│   ├── dashboard/                   # Embedded developer Web Dashboard server & static assets
 │   ├── detect/                      # Multi-layer detection engine
-│   │   ├── detect.go                # Orchestrator & layer priority
+│   │   ├── detect.go                # Detection orchestrator & layer priority
 │   │   ├── railpack.go              # Railpack v0.39+ resolver, downloader & parser
 │   │   ├── rules.go                 # Dynamic framework rules engine
 │   │   └── frameworks.json          # Specialized framework signatures
 │   ├── k8s/                         # Kubernetes logic
-│   │   └── deployer.go              # Helm chart generator, dependencies, and rollout
+│   │   ├── deployer.go              # Helm chart generator, dependencies, and rollout
+│   │   └── rbac.go                  # Context switcher & K3s node IP resolver
 │   └── ui/                          # Terminal UI components and banners
 └── vscode-extension/                # VS Code Marketplace Extension
-    ├── package.json                 # Extension manifest (v1.7.0)
+    ├── package.json                 # Extension manifest (v1.14.0)
     ├── extension.js                 # VS Code extension controller & status bar
+    ├── README.md                    # Extension documentation
     ├── bin/                         # Bundled idlistack executable
-    └── idlistack-vscode-1.7.0.vsix  # Packaged extension bundle
+    └── idlistack-vscode-1.14.0.vsix # Packaged extension bundle
 ```
 
 ---
 
-## 6. Production Management & Debugging
+## 8. Operational Runbook & Troubleshooting
 
-When managing an IdliStack application directly via Kubernetes:
-
+### Teleport Management
 ```bash
-# View all pods, services, and PVCs
-kubectl get all,pvc -n idlistack-<app-name>
+# Check Teleport cluster health
+tctl status
 
-# View Helm release history
-helm history <app-name> -n idlistack-<app-name>
+# Verify Kubernetes cluster registration
+tctl kube ls
 
-# Roll back manually to a previous revision
-helm rollback <app-name> 1 -n idlistack-<app-name>
+# Inspect active Machine-to-Machine bots
+tctl bots ls
 
-# View K3s containerd images natively
+# List Teleport roles and users
+tctl users ls
+```
+
+### K3s Containerd Inspection
+```bash
+# List all sideloaded images inside K3s
 sudo k3s crictl images
 
-# View running containerd containers
+# List active containers
 sudo k3s crictl ps
+
+# Inspect logs of a specific container directly
+sudo k3s crictl logs <container-id>
 ```
+
+### Teleport Service Management
+Teleport runs as a systemd user service:
+```bash
+# Check status
+systemctl --user status teleport.service
+
+# Restart Teleport
+systemctl --user restart teleport.service
+
+# View Teleport logs
+journalctl --user -u teleport.service -f
+```
+
+---
+
+## 9. Conclusion
+
+The IdliStack architecture bridges the gap between modern zero-config developer platforms and enterprise-grade Kubernetes operations. By integrating **Railpack** for container builds, **K3s containerd** for instant local sideloading, **Helm v3** for atomic lifecycle management, and **Teleport M2M** for Zero-Trust RBAC under a unified **Frappe Control Plane**, IdliStack delivers uncompromised developer speed with production-grade security guarantees.

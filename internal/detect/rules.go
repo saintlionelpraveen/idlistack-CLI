@@ -233,11 +233,11 @@ func detectWithRules(projectDir string, cfg *config.Config, verbose bool) (*buil
 					content = strings.ReplaceAll(content, "{{version}}", version)
 				}
 
-				outDir := filepath.Join(projectDir, ".idlistack")
-				os.MkdirAll(outDir, 0755)
-				outPath := filepath.Join(outDir, "Dockerfile."+fw.ID)
-				os.WriteFile(outPath, []byte(content), 0644)
-				plan.DockerfilePath = filepath.Join(".idlistack", "Dockerfile."+fw.ID)
+				tmpDir := filepath.Join(os.TempDir(), "idlistack-build")
+				_ = os.MkdirAll(tmpDir, 0755)
+				outPath := filepath.Join(tmpDir, fmt.Sprintf("Dockerfile.%s.%s", filepath.Base(projectDir), fw.ID))
+				_ = os.WriteFile(outPath, []byte(content), 0644)
+				plan.DockerfilePath = outPath
 			}
 
 			plan.Runtime = detectRuntimeVersion(projectApp, fw.Provider)

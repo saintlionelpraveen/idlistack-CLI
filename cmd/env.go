@@ -8,6 +8,7 @@ import (
 	"github.com/fatih/color"
 	"github.com/idlistack/cli/internal/auth"
 	"github.com/idlistack/cli/internal/config"
+	"github.com/idlistack/cli/internal/k8s"
 	"github.com/idlistack/cli/internal/ui"
 	"github.com/spf13/cobra"
 )
@@ -51,8 +52,12 @@ func runEnvSet(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	namespace := fmt.Sprintf("idlistack-%s", cfg.Project.Name)
-	secretName := fmt.Sprintf("%s-env", cfg.Project.Name)
+	namespace := k8s.ResolveNamespace(ctx, cfg.Deploy.Namespace, cfg.Project.Name)
+	appName := k8s.CleanAppName(cfg.Project.Name)
+	if appName == "" || appName == "app" {
+		appName = k8s.CleanAppName(namespace)
+	}
+	secretName := fmt.Sprintf("%s-env", appName)
 
 	// Parse KEY=VALUE pairs
 	literals := []string{}
@@ -63,9 +68,11 @@ func runEnvSet(cmd *cobra.Command, args []string) error {
 		literals = append(literals, fmt.Sprintf("--from-literal=%s", arg))
 	}
 
-	// Ensure namespace exists
-	auth.KubectlCommand(ctx, "create", "namespace", namespace, "--dry-run=client", "-o", "yaml").
-		Output()
+	// Ensure namespace exists if isolated local namespace
+	if strings.HasPrefix(namespace, "idlistack-") && !k8s.IsClusterRemote(ctx) {
+		auth.KubectlCommand(ctx, "create", "namespace", namespace, "--dry-run=client", "-o", "yaml").
+			Output()
+	}
 
 	// Create or update the secret
 	deleteArgs := []string{"delete", "secret", secretName, "-n", namespace, "--ignore-not-found"}
@@ -93,8 +100,12 @@ func runEnvList(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	namespace := fmt.Sprintf("idlistack-%s", cfg.Project.Name)
-	secretName := fmt.Sprintf("%s-env", cfg.Project.Name)
+	namespace := k8s.ResolveNamespace(cmd.Context(), cfg.Deploy.Namespace, cfg.Project.Name)
+	appName := k8s.CleanAppName(cfg.Project.Name)
+	if appName == "" || appName == "app" {
+		appName = k8s.CleanAppName(namespace)
+	}
+	secretName := fmt.Sprintf("%s-env", appName)
 
 	getCmd := auth.KubectlCommand(cmd.Context(), "get", "secret", secretName,
 		"-n", namespace, "-o", "jsonpath={.data}")

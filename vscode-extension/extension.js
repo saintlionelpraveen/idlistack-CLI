@@ -52,9 +52,9 @@ function resolveCliPath(extensionPath) {
 }
 
 /**
- * Reads ~/.idlistack/credentials.json and returns active Keycloak + K3s RBAC session if valid
+ * Reads ~/.idlistack/credentials.json and returns active Frappe + Teleport RBAC session if valid
  */
-function getActiveKeycloakSession() {
+function getActiveSession() {
     try {
         const credPath = path.join(os.homedir(), '.idlistack', 'credentials.json');
         if (!fs.existsSync(credPath)) {
@@ -62,23 +62,31 @@ function getActiveKeycloakSession() {
         }
         const raw = fs.readFileSync(credPath, 'utf8');
         const creds = JSON.parse(raw);
-        if (!creds || !creds.username || !creds.accessToken) {
+        const username = creds.user || creds.username;
+        const token = creds.sessionToken || creds.accessToken;
+        if (!creds || !username || !token) {
             return null;
         }
         if (creds.expiresAt && new Date(creds.expiresAt).getTime() < Date.now()) {
             return null;
         }
-        return creds;
+        return {
+            ...creds,
+            username: username,
+            accessToken: token,
+            frappeUrl: creds.frappeUrl || 'http://localhost:8000'
+        };
     } catch (_) {
         return null;
     }
 }
+const getActiveKeycloakSession = getActiveSession;
 
 /**
  * @param {vscode.ExtensionContext} context
  */
 function activate(context) {
-    console.log('IdliStack extension v1.13.0 active (Local K3s & Keycloak OIDC ready)!');
+    console.log('IdliStack extension active (Frappe Auth & Teleport K3s RBAC ready)!');
 
     const binDir = path.join(context.extensionPath, 'bin');
     const isWin = os.platform() === 'win32';
@@ -103,14 +111,12 @@ function activate(context) {
 
     function updateEnvironmentVariables() {
         const idliConfig = vscode.workspace.getConfiguration('idlistack');
-        const keycloakUrl = idliConfig.get('keycloakUrl') || 'http://127.0.0.1:30080';
+        const frappeUrl = idliConfig.get('frappeUrl') || 'http://localhost:8000';
 
         if (context.environmentVariableCollection) {
             context.environmentVariableCollection.prepend('PATH', `${usrLocalBin}${path.delimiter}${userLocalBin}${path.delimiter}${binDir}${path.delimiter}`);
-            context.environmentVariableCollection.replace('IDLISTACK_KEYCLOAK_URL', keycloakUrl);
-            context.environmentVariableCollection.delete('IDLISTACK_CLOUD_HOST');
-            context.environmentVariableCollection.delete('KUBECONFIG');
-            context.environmentVariableCollection.description = 'IdliStack CLI environment (Local K3s)';
+            context.environmentVariableCollection.replace('IDLISTACK_FRAPPE_URL', frappeUrl);
+            context.environmentVariableCollection.description = 'IdliStack CLI environment (Frappe & Teleport)';
         }
     }
     updateEnvironmentVariables();
@@ -123,16 +129,14 @@ function activate(context) {
             fs.mkdirSync(localBin, { recursive: true });
         }
         const symlinkPath = path.join(localBin, isWin ? 'idlistack.exe' : 'idlistack');
-        const cliPath = resolveCliPath(context.extensionPath);
-        if (!fs.existsSync(symlinkPath) && fs.existsSync(cliPath)) {
+        const bundledCli = path.join(binDir, isWin ? 'idlistack.exe' : 'idlistack');
+        if (fs.existsSync(bundledCli)) {
             try {
-                fs.symlinkSync(cliPath, symlinkPath);
-            } catch (_) {
-                fs.copyFileSync(cliPath, symlinkPath);
+                fs.copyFileSync(bundledCli, symlinkPath);
                 if (!isWin) {
                     fs.chmodSync(symlinkPath, 0o755);
                 }
-            }
+            } catch (_) {}
         }
 
         // Ensure ~/.local/bin is present in ~/.bashrc and ~/.zshrc if not already there
@@ -155,16 +159,26 @@ function activate(context) {
     function getWorkspaceRoot() {
         const workspaceFolders = vscode.workspace.workspaceFolders;
         if (!workspaceFolders || workspaceFolders.length === 0) {
-            vscode.window.showErrorMessage('Please open a workspace folder to use IdliStack.');
             return null;
         }
         return workspaceFolders[0].uri.fsPath;
     }
 
-    // Helper to get or create a dedicated terminal with explicit PATH & Local K3s environment
+    // Proactively purge any legacy .idlistack directory in workspace
+    try {
+        const currentRoot = getWorkspaceRoot();
+        if (currentRoot) {
+            const legacyDir = path.join(currentRoot, '.idlistack');
+            if (fs.existsSync(legacyDir)) {
+                fs.rmSync(legacyDir, { recursive: true, force: true });
+            }
+        }
+    } catch (_) {}
+
+    // Helper to get or create a dedicated terminal with explicit PATH & Frappe/Teleport environment
     function getTerminal(name = 'IdliStack') {
         const idliConfig = vscode.workspace.getConfiguration('idlistack');
-        const keycloakUrl = idliConfig.get('keycloakUrl') || 'http://127.0.0.1:30080';
+        const frappeUrl = idliConfig.get('frappeUrl') || 'http://localhost:8000';
         const customPath = `${usrLocalBin}${path.delimiter}${userLocalBin}${path.delimiter}${binDir}${path.delimiter}${process.env.PATH || ''}`;
 
         let terminal = vscode.window.terminals.find(t => t.name === name);
@@ -174,7 +188,7 @@ function activate(context) {
                 cwd: getWorkspaceRoot() || undefined,
                 env: {
                     PATH: customPath,
-                    IDLISTACK_KEYCLOAK_URL: keycloakUrl
+                    IDLISTACK_FRAPPE_URL: frappeUrl
                 }
             });
         }
@@ -189,12 +203,11 @@ function activate(context) {
     function updateStatusBar() {
         const session = getActiveKeycloakSession();
         if (session) {
-            const scopeLabel = session.scope === 'cluster-wide' ? 'Cluster RBAC' : 'NS RBAC';
             statusBarItem.text = `$(server) IdliStack (${session.username})`;
-            statusBarItem.tooltip = `IdliStack: Local K3s\nUser: ${session.username}\nScope: ${scopeLabel}\nKeycloak: http://127.0.0.1:30080\nClick to open IdliStack menu`;
+            statusBarItem.tooltip = `IdliStack: Local K3s (Teleport RBAC)\nUser: ${session.username}\nBackend: Frappe (${session.frappeUrl})\nClick to open IdliStack menu`;
         } else {
             statusBarItem.text = `$(server) IdliStack (Login Required)`;
-            statusBarItem.tooltip = `IdliStack: Local K3s\nClick to authenticate with Keycloak OIDC`;
+            statusBarItem.tooltip = `IdliStack: Local K3s\nClick to authenticate with Frappe`;
         }
         statusBarItem.show();
     }
@@ -202,7 +215,7 @@ function activate(context) {
     const statusInterval = setInterval(updateStatusBar, 3000);
     context.subscriptions.push({ dispose: () => clearInterval(statusInterval) });
 
-    // Command: idlistack.login (Opens Auth Portal UI)
+    // Command: idlistack.login (Opens Frappe Auth Portal)
     let loginDisposable = vscode.commands.registerCommand('idlistack.login', function () {
         const rootPath = getWorkspaceRoot();
         const cli = resolveCliPath(context.extensionPath);
@@ -211,7 +224,7 @@ function activate(context) {
             terminal.sendText(`cd "${rootPath}"`);
         }
         terminal.sendText(`"${cli}" login`);
-        vscode.window.showInformationMessage('IdliStack: Launching Keycloak Authentication Portal...');
+        vscode.window.showInformationMessage('IdliStack: Launching Frappe Authentication Portal...');
     });
 
     // Command: idlistack.admin (Opens Local Admin Dashboard)
@@ -224,14 +237,6 @@ function activate(context) {
         }
         terminal.sendText(`"${cli}" admin`);
         vscode.window.showInformationMessage('IdliStack: Launching Admin Dashboard on port 4202...');
-    });
-
-    // Command: idlistack.authSetup (Deploys Keycloak inside K3s idlistack-auth namespace)
-    let authSetupDisposable = vscode.commands.registerCommand('idlistack.authSetup', function () {
-        const cli = resolveCliPath(context.extensionPath);
-        const terminal = getTerminal();
-        terminal.sendText(`"${cli}" auth setup`);
-        vscode.window.showInformationMessage('IdliStack: Deploying Keycloak inside local K3s cluster (namespace: idlistack-auth)...');
     });
 
     // Command: idlistack.whoami
@@ -335,27 +340,26 @@ function activate(context) {
     let menuDisposable = vscode.commands.registerCommand('idlistack.menu', async function () {
         const session = getActiveKeycloakSession();
         const authDesc = session
-            ? `Logged in as ${session.username} (${session.scope})`
-            : 'Authenticate with Keycloak OIDC (Web Portal / CLI)';
+            ? `Logged in via Frappe as ${session.username}`
+            : 'Authenticate with Frappe backend (fellowship site)';
 
         const items = [
             { label: '$(dashboard) Open Admin Dashboard', description: 'Monitor local K3s resources, scale replicas & manage tenants', cmd: 'idlistack.admin' },
-            { label: '$(shield) Login / Register (Auth Portal)', description: authDesc, cmd: 'idlistack.login' },
-            { label: '$(account) Check Auth & RBAC Scope (Whoami)', description: 'Show active user, groups & namespaces', cmd: 'idlistack.whoami' },
-            { label: '$(rocket) Deploy Application (Local K3s)', description: 'Verify RBAC, build OCI image & deploy via Helm', cmd: 'idlistack.up' },
+            { label: '$(shield) Frappe Login (Auth Portal)', description: authDesc, cmd: 'idlistack.login' },
+            { label: '$(account) Check Auth & RBAC Scope (Whoami)', description: 'Show active user, Frappe URL & allowed namespaces', cmd: 'idlistack.whoami' },
+            { label: '$(rocket) Deploy Application (Local K3s)', description: 'Verify Teleport RBAC, build OCI image & deploy via Helm', cmd: 'idlistack.up' },
             { label: '$(search) Inspect Stack & Plan', description: 'Preview stack, version, framework & build plan', cmd: 'idlistack.inspect' },
             { label: '$(terminal) Open IdliStack Terminal', description: 'Open terminal with idlistack CLI pre-configured', cmd: 'idlistack.terminal' },
             { label: '$(server-environment) Check Status', description: 'Check running pods & launch web dashboard', cmd: 'idlistack.status' },
             { label: '$(terminal) View Logs', description: 'Stream container logs from K3s', cmd: 'idlistack.logs' },
-            { label: '$(key) Setup Keycloak Auth Layer', description: 'Deploy Keycloak inside local K3s cluster (idlistack-auth)', cmd: 'idlistack.authSetup' },
             { label: '$(trash) Destroy Deployment', description: 'Uninstall Helm release from K3s', cmd: 'idlistack.down' },
-            { label: '$(sign-out) Logout Session', description: 'Clear saved authentication token & RBAC session', cmd: 'idlistack.logout' }
+            { label: '$(sign-out) Logout Session', description: 'Clear saved authentication token & revoke Frappe session', cmd: 'idlistack.logout' }
         ];
 
         const selection = await vscode.window.showQuickPick(items, {
             placeHolder: session
-                ? `IdliStack [Local K3s] — Authenticated as ${session.username}`
-                : 'IdliStack [Local K3s] — Login required before deploying'
+                ? `IdliStack [Frappe + Teleport K3s] — Authenticated as ${session.username}`
+                : 'IdliStack [Frappe + Teleport K3s] — Login required before deploying'
         });
 
         if (selection && selection.cmd) {
@@ -364,11 +368,11 @@ function activate(context) {
     });
 
     // Welcome Notification on First Install
-    const welcomed = context.globalState.get('idlistack.welcomed_v1130');
+    const welcomed = context.globalState.get('idlistack.welcomed_v1140');
     if (!welcomed) {
-        context.globalState.update('idlistack.welcomed_v1130', true);
+        context.globalState.update('idlistack.welcomed_v1140', true);
         vscode.window.showInformationMessage(
-            'IdliStack v1.13.0 is ready with Local K3s & Keycloak OIDC!',
+            'IdliStack v1.14.0 is ready with Frappe Auth Portal & Teleport Zero-Trust RBAC!',
             'Open Admin Dashboard',
             'Login',
             'Open Terminal'
@@ -382,7 +386,6 @@ function activate(context) {
     context.subscriptions.push(
         loginDisposable,
         adminDisposable,
-        authSetupDisposable,
         whoamiDisposable,
         logoutDisposable,
         terminalDisposable,

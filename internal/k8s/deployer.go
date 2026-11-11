@@ -29,44 +29,136 @@ type Deployer struct {
 	appName    string // RFC 1123 compliant lowercase name for all K8s resources
 	projectDir string
 	kubeToken  string
+	helmDir    string // Transient directory for atomic Helm packaging
+}
+
+// SanitizeK8sNamespace converts any project name or raw namespace into a valid RFC 1123 DNS label:
+// lowercase alphanumeric and hyphens, no underscores, no dots, starting and ending with alphanumeric.
+// It also strips redundant 'idlistack-' prefixes so that every namespace is canonical:
+// e.g. "idli_ghost_theme_builder" -> "idlistack-idli-ghost-theme-builder"
+// e.g. "idlistack-idli_ghost_theme_builder" -> "idlistack-idli-ghost-theme-builder"
+// e.g. "Idlistack-frontend-CMS" -> "idlistack-frontend-cms"
+func SanitizeK8sNamespace(raw string) string {
+	s := strings.ToLower(raw)
+	// Replace underscores, dots, and spaces with hyphens
+	s = strings.ReplaceAll(s, "_", "-")
+	s = strings.ReplaceAll(s, ".", "-")
+	s = strings.ReplaceAll(s, " ", "-")
+
+	var result []byte
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' {
+			result = append(result, c)
+		}
+	}
+	s = strings.Trim(string(result), "-")
+	for strings.HasPrefix(s, "idlistack-") {
+		s = strings.TrimPrefix(s, "idlistack-")
+		s = strings.Trim(s, "-")
+	}
+	if s == "" {
+		s = "app"
+	}
+	if len(s) > 50 {
+		s = strings.TrimRight(s[:50], "-")
+	}
+	return fmt.Sprintf("idlistack-%s", s)
+}
+
+// CleanAppName extracts the short application name from a project name or namespace
+func CleanAppName(raw string) string {
+	ns := SanitizeK8sNamespace(raw)
+	clean := strings.TrimPrefix(ns, "idlistack-")
+	if clean == "" {
+		return "app"
+	}
+	return clean
+}
+
+// GetActiveKubeNamespace queries kubectl for the default namespace of the active context
+func GetActiveKubeNamespace(ctx context.Context) string {
+	cmd := exec.CommandContext(ctx, "kubectl", "config", "view", "--minify", "-o", "jsonpath={.contexts[0].context.namespace}")
+	out, err := cmd.Output()
+	if err == nil {
+		return strings.TrimSpace(string(out))
+	}
+	return ""
+}
+
+// IsClusterRemote checks if the current kubectl cluster endpoint is remote (not localhost)
+func IsClusterRemote(ctx context.Context) bool {
+	cmdSrv := exec.CommandContext(ctx, "kubectl", "config", "view", "--minify", "-o", "jsonpath={.clusters[0].cluster.server}")
+	if outSrv, err := cmdSrv.Output(); err == nil {
+		rawServer := strings.TrimSpace(string(outSrv))
+		if u, err := url.Parse(rawServer); err == nil && u.Hostname() != "" {
+			h := u.Hostname()
+			return h != "127.0.0.1" && h != "localhost" && h != "0.0.0.0"
+		}
+	}
+	return false
+}
+
+// IsRemoteCluster returns true if the active cluster endpoint is remote
+func (d *Deployer) IsRemoteCluster(ctx context.Context) bool {
+	return IsClusterRemote(ctx)
+}
+
+// SetImageTag updates the container image tag used for deployment
+func (d *Deployer) SetImageTag(tag string) {
+	d.imageTag = tag
+}
+
+// ResolveNamespace dynamically resolves the target namespace based on active kube context and config.
+// If the active kube context specifies a namespace (e.g. whatomate-vendor or team namespace), it is prioritized
+// over legacy default prefix "idlistack-".
+func ResolveNamespace(ctx context.Context, configuredNS, projectName string) string {
+	activeNS := GetActiveKubeNamespace(ctx)
+	if activeNS != "" && activeNS != "default" {
+		if configuredNS == "" || strings.HasPrefix(configuredNS, "idlistack-") || configuredNS == activeNS {
+			return activeNS
+		}
+		return strings.TrimSpace(configuredNS)
+	}
+
+	if configuredNS != "" {
+		return SanitizeK8sNamespace(configuredNS)
+	}
+	return SanitizeK8sNamespace(projectName)
 }
 
 // NewDeployer creates a new Deployer instance
 func NewDeployer(cfg *config.Config, plan *buildplan.Plan, imageTag string, projectDir string) *Deployer {
-	sanitized := sanitizeK8sName(cfg.Project.Name)
+	targetNS := ResolveNamespace(context.Background(), cfg.Deploy.Namespace, cfg.Project.Name)
+
+	cleanApp := CleanAppName(cfg.Project.Name)
+	if cleanApp == "" || cleanApp == "app" {
+		cleanApp = CleanAppName(targetNS)
+	}
+
 	return &Deployer{
 		config:     cfg,
 		plan:       plan,
 		imageTag:   imageTag,
-		namespace:  fmt.Sprintf("idlistack-%s", sanitized),
-		appName:    sanitized,
+		namespace:  targetNS,
+		appName:    cleanApp,
 		projectDir: projectDir,
 	}
 }
 
+// AppName returns the canonical sanitized app name
+func (d *Deployer) AppName() string {
+	return d.appName
+}
+
+// Namespace returns the target Kubernetes namespace
+func (d *Deployer) Namespace() string {
+	return d.namespace
+}
+
 // sanitizeK8sName converts a project name to a valid RFC 1123 DNS label.
-// Must be lowercase alphanumeric, may contain '-' or '.', and must start/end
-// with an alphanumeric character.
 func sanitizeK8sName(name string) string {
-	// Lowercase
-	s := strings.ToLower(name)
-	// Replace underscores and spaces with hyphens
-	s = strings.ReplaceAll(s, "_", "-")
-	s = strings.ReplaceAll(s, " ", "-")
-	// Remove any characters that aren't alphanumeric, hyphen, or dot
-	var result []byte
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '.' {
-			result = append(result, c)
-		}
-	}
-	// Trim leading/trailing hyphens and dots
-	s = strings.Trim(string(result), "-.")
-	if s == "" {
-		s = "app"
-	}
-	return s
+	return CleanAppName(name)
 }
 
 // Deploy executes the full deployment pipeline
@@ -79,26 +171,42 @@ func (d *Deployer) Deploy(ctx context.Context, verbose bool) (string, error) {
 	}
 	defer releaseLock(lockFile, lockPath)
 
-	// ─── Initialize Helm Directory ──────────────────────────────────
-	helmDir := filepath.Join(d.projectDir, ".idlistack", "helm")
-	os.RemoveAll(helmDir)
-	os.MkdirAll(filepath.Join(helmDir, "templates"), 0755)
+	// ─── Initialize Transient Helm Directory ─────────────────────────
+	tmpHelmDir, err := os.MkdirTemp("", fmt.Sprintf("idlistack-helm-%s-*", d.appName))
+	if err != nil {
+		return "", fmt.Errorf("failed to create temporary helm directory: %w", err)
+	}
+	defer os.RemoveAll(tmpHelmDir)
+	d.helmDir = tmpHelmDir
+
+	if err := os.MkdirAll(filepath.Join(d.helmDir, "templates"), 0755); err != nil {
+		return "", fmt.Errorf("failed to create helm templates directory: %w", err)
+	}
 
 	chartYaml := fmt.Sprintf("apiVersion: v2\nname: %s\ndescription: Idlistack App\nversion: 0.1.0\nappVersion: 1.0.0\n", d.appName)
-	os.WriteFile(filepath.Join(helmDir, "Chart.yaml"), []byte(chartYaml), 0644)
+	if err := os.WriteFile(filepath.Join(d.helmDir, "Chart.yaml"), []byte(chartYaml), 0644); err != nil {
+		return "", fmt.Errorf("failed to write Chart.yaml: %w", err)
+	}
+
+	// Clean up any stale legacy directory
+	_ = os.RemoveAll(filepath.Join(d.projectDir, ".idlistack"))
 
 	// ─── Namespace Manager ──────────────────────────────────────────
 	if err := d.ensureNamespace(ctx); err != nil {
 		return "", err
 	}
 
-	// ─── Verify Keycloak Auth & Bind K3s RBAC (Pre-Helm Gate) ───────
-	k8sToken, kcUser, rbacScope, err := VerifyDeployAuthAndGetToken(ctx, d.namespace)
-	if err != nil {
-		return "", fmt.Errorf("Keycloak RBAC gate blocked Helm deploy: %w", err)
+	// ─── Verify Auth & Bind K3s RBAC (Pre-Helm Gate) ───────
+	if !d.IsRemoteCluster(ctx) {
+		k8sToken, authUser, rbacScope, err := VerifyDeployAuthAndGetToken(ctx, d.namespace)
+		if err != nil {
+			return "", fmt.Errorf("RBAC authorization gate blocked Helm deploy: %w", err)
+		}
+		d.kubeToken = k8sToken
+		ui.Detail("Teleport RBAC verified: user=%s, scope=%s, namespace=%s", color.CyanString(authUser), color.GreenString(rbacScope), d.namespace)
+	} else {
+		ui.Detail("Remote cluster verified: namespace=%s", color.GreenString(d.namespace))
 	}
-	d.kubeToken = k8sToken
-	ui.Detail("Keycloak RBAC verified: user=%s, scope=%s, namespace=%s", color.CyanString(kcUser), color.GreenString(rbacScope), d.namespace)
 
 	// ─── Clean up previous failed deployments ───────────────────────
 	d.cleanupOldDeployment(ctx)
@@ -150,11 +258,31 @@ func (d *Deployer) Deploy(ctx context.Context, verbose bool) (string, error) {
 // ─── Namespace ──────────────────────────────────────────────────────────
 
 func (d *Deployer) ensureNamespace(ctx context.Context) error {
+	// If namespace is already available (e.g. whatomate-vendor or remote scoped context), verify access and return
+	if !strings.HasPrefix(d.namespace, "idlistack-") || d.IsRemoteCluster(ctx) {
+		chkPods := exec.CommandContext(ctx, "kubectl", "get", "pods", "-n", d.namespace, "--request-timeout=3s")
+		if err := chkPods.Run(); err == nil {
+			return nil
+		}
+	}
+
 	// Check if namespace exists and if it is in Terminating state
 	checkCmd := exec.CommandContext(ctx, "kubectl", "get", "namespace", d.namespace, "-o", "jsonpath={.status.phase}")
 	phaseBytes, err := checkCmd.Output()
 	if err != nil {
-		// Namespace doesn't exist yet; Helm will create it with --create-namespace
+		// Namespace doesn't exist yet; attempt creation via local admin kubeconfig if available
+		home, _ := os.UserHomeDir()
+		adminKcs := []string{
+			filepath.Join(home, ".kube", "config"),
+			filepath.Join(home, ".idlistack", "k3s-kubeconfig.yaml"),
+			"/etc/rancher/k3s/k3s.yaml",
+		}
+		for _, adminKc := range adminKcs {
+			if _, statErr := os.Stat(adminKc); statErr == nil {
+				_ = exec.CommandContext(ctx, "kubectl", "--kubeconfig="+adminKc, "create", "namespace", d.namespace).Run()
+				break
+			}
+		}
 		return nil
 	}
 
@@ -589,14 +717,22 @@ spec:
 // ─── Rollout ────────────────────────────────────────────────────────────
 
 func (d *Deployer) helmCmd(ctx context.Context, args ...string) *exec.Cmd {
-	if d.kubeToken != "" {
-		args = append(args, "--kube-token="+d.kubeToken)
+	if kc := os.Getenv("KUBECONFIG"); kc != "" {
+		args = append([]string{"--kubeconfig=" + kc}, args...)
+	} else {
+		home, _ := os.UserHomeDir()
+		vendorKc := filepath.Join(home, ".kube", "whatomate-vendor-kubeconfig.yaml")
+		if _, err := os.Stat(vendorKc); err == nil {
+			args = append([]string{"--kubeconfig=" + vendorKc}, args...)
+		} else if d.kubeToken != "" {
+			args = append(args, "--kube-token="+d.kubeToken)
+		}
 	}
 	return exec.CommandContext(ctx, "helm", args...)
 }
 
 func (d *Deployer) executeHelmDeploy(ctx context.Context) error {
-	helmDir := filepath.Join(d.projectDir, ".idlistack", "helm")
+	helmDir := d.helmDir
 
 	helmTimeout := "180s"
 
@@ -622,7 +758,6 @@ func (d *Deployer) executeHelmDeploy(ctx context.Context) error {
 
 	cmd := d.helmCmd(ctx, "upgrade", "--install", d.appName, helmDir,
 		"--namespace", d.namespace,
-		"--create-namespace",
 		"--wait", "--timeout", helmTimeout,
 		"--atomic") // auto-rollback on failure; auto-purge on failed first install
 	cmd.Stdout = os.Stdout
@@ -765,6 +900,11 @@ func (d *Deployer) getServiceURL(ctx context.Context) string {
 }
 
 func (d *Deployer) getNodeIP(ctx context.Context) string {
+	return GetNodeIP(ctx)
+}
+
+// GetNodeIP discovers the external/public address of the K3s node
+func GetNodeIP(ctx context.Context) string {
 	// 1. Check if kubeconfig points to a remote host (if custom cluster host is configured)
 	cmdSrv := exec.CommandContext(ctx, "kubectl", "config", "view", "--minify", "-o", "jsonpath={.clusters[0].cluster.server}")
 	if outSrv, err := cmdSrv.Output(); err == nil {
@@ -809,14 +949,25 @@ func (d *Deployer) allocateNodePort(ctx context.Context) int {
 		}
 	}
 
-	// 2. Query all currently used NodePorts across all namespaces
-	cmdUsed := exec.CommandContext(ctx, "kubectl", "get", "svc", "-A", "-o", "jsonpath={.items[*].spec.ports[*].nodePort}")
+	// 2. Query all currently used NodePorts across namespace (and cluster if local/permitted)
 	usedPorts := make(map[int]bool)
-	if out, err := cmdUsed.Output(); err == nil {
+	cmdNS := exec.CommandContext(ctx, "kubectl", "get", "svc", "-n", d.namespace, "-o", "jsonpath={.items[*].spec.ports[*].nodePort}")
+	if out, err := cmdNS.Output(); err == nil {
 		for _, field := range strings.Fields(string(out)) {
 			var p int
 			if _, err := fmt.Sscanf(field, "%d", &p); err == nil && p > 0 {
 				usedPorts[p] = true
+			}
+		}
+	}
+	if !d.IsRemoteCluster(ctx) {
+		cmdUsed := exec.CommandContext(ctx, "kubectl", "get", "svc", "-A", "-o", "jsonpath={.items[*].spec.ports[*].nodePort}")
+		if out, err := cmdUsed.Output(); err == nil {
+			for _, field := range strings.Fields(string(out)) {
+				var p int
+				if _, err := fmt.Sscanf(field, "%d", &p); err == nil && p > 0 {
+					usedPorts[p] = true
+				}
 			}
 		}
 	}
@@ -879,7 +1030,7 @@ func releaseLock(f *os.File, path string) {
 // ─── Helpers ────────────────────────────────────────────────────────────
 
 func (d *Deployer) writeManifest(name, manifest string) error {
-	path := filepath.Join(d.projectDir, ".idlistack", "helm", "templates", name+".yaml")
+	path := filepath.Join(d.helmDir, "templates", name+".yaml")
 	return os.WriteFile(path, []byte(manifest), 0644)
 }
 
@@ -1407,9 +1558,14 @@ func (d *Deployer) syncLocalDockerData(ctx context.Context) {
 		return // No local container to sync from
 	}
 	
-	// Create a marker so we only do this once
-	markerFile := filepath.Join(d.projectDir, ".idlistack", "data_synced.lock")
-	if _, err := os.Stat(markerFile); err == nil {
+	// Check marker in .idlistack.json (or legacy marker) so we only do this once
+	state, _ := config.LoadProjectState(d.projectDir)
+	legacyMarker := filepath.Join(d.projectDir, ".idlistack", "data_synced.lock")
+	legacyExists := false
+	if _, err := os.Stat(legacyMarker); err == nil {
+		legacyExists = true
+	}
+	if (state != nil && state.DataSynced) || legacyExists {
 		return // Already synced
 	}
 
@@ -1447,6 +1603,10 @@ func (d *Deployer) syncLocalDockerData(ctx context.Context) {
 	// Scale up the app again
 	exec.CommandContext(ctx, "kubectl", "scale", "deployment", d.appName, "--replicas=1", "-n", d.namespace).Run()
 	
-	os.WriteFile(markerFile, []byte("done"), 0644)
+	if state != nil {
+		state.DataSynced = true
+		_ = config.SaveProjectState(d.projectDir, state)
+	}
+	_ = os.Remove(legacyMarker)
 	ui.Detail("Current data successfully migrated to dynamic environment!")
 }
