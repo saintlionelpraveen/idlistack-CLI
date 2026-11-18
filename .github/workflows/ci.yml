@@ -1,18 +1,7 @@
 name: CI — Build & Test
 
 on:
-  push:
-    branches:
-      - main
-      - "feat/**"
-      - "fix/**"
-  pull_request:
-    branches:
-      - main
-
-permissions:
-  contents: read
-
+  workflow_dispatch:
 jobs:
   test-and-build:
     name: Go Build, Vet & Unit Tests
