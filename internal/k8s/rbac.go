@@ -535,13 +535,17 @@ func EnsureNamespaceRBAC(ctx context.Context, username string, groups []string, 
 	home, _ := os.UserHomeDir()
 	adminArgs := []string{}
 	for _, adminKc := range []string{
-		filepath.Join(home, ".kube", "config"),
 		filepath.Join(home, ".idlistack", "k3s-kubeconfig.yaml"),
+		filepath.Join(home, ".kube", "config"),
 		"/etc/rancher/k3s/k3s.yaml",
 	} {
 		if _, statErr := os.Stat(adminKc); statErr == nil {
-			adminArgs = append(adminArgs, "--kubeconfig="+adminKc)
-			break
+			// Ensure kubeconfig is responsive before selecting it
+			probeCmd := exec.CommandContext(quickCtx, "kubectl", "--kubeconfig="+adminKc, "get", "nodes", "--request-timeout=2s")
+			if probeCmd.Run() == nil {
+				adminArgs = append(adminArgs, "--kubeconfig="+adminKc)
+				break
+			}
 		}
 	}
 

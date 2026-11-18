@@ -270,17 +270,23 @@ func (d *Deployer) ensureNamespace(ctx context.Context) error {
 	checkCmd := exec.CommandContext(ctx, "kubectl", "get", "namespace", d.namespace, "-o", "jsonpath={.status.phase}")
 	phaseBytes, err := checkCmd.Output()
 	if err != nil {
-		// Namespace doesn't exist yet; attempt creation via local admin kubeconfig if available
+		// Namespace doesn't exist yet; attempt creation with active context first
+		if createErr := exec.CommandContext(ctx, "kubectl", "create", "namespace", d.namespace).Run(); createErr == nil {
+			return nil
+		}
+
+		// Attempt creation via local admin kubeconfigs if available
 		home, _ := os.UserHomeDir()
 		adminKcs := []string{
-			filepath.Join(home, ".kube", "config"),
 			filepath.Join(home, ".idlistack", "k3s-kubeconfig.yaml"),
+			filepath.Join(home, ".kube", "config"),
 			"/etc/rancher/k3s/k3s.yaml",
 		}
 		for _, adminKc := range adminKcs {
 			if _, statErr := os.Stat(adminKc); statErr == nil {
-				_ = exec.CommandContext(ctx, "kubectl", "--kubeconfig="+adminKc, "create", "namespace", d.namespace).Run()
-				break
+				if runErr := exec.CommandContext(ctx, "kubectl", "--kubeconfig="+adminKc, "create", "namespace", d.namespace).Run(); runErr == nil {
+					break
+				}
 			}
 		}
 		return nil
@@ -758,6 +764,7 @@ func (d *Deployer) executeHelmDeploy(ctx context.Context) error {
 
 	cmd := d.helmCmd(ctx, "upgrade", "--install", d.appName, helmDir,
 		"--namespace", d.namespace,
+		"--create-namespace",
 		"--wait", "--timeout", helmTimeout,
 		"--atomic") // auto-rollback on failure; auto-purge on failed first install
 	cmd.Stdout = os.Stdout
